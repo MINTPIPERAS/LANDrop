@@ -1,0 +1,26 @@
+# Node / frontend
+node_modules/
+dist/
+*.local
+
+# Rust
+src-tauri/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+
+# PyInstaller sidecar output (rebuilt by scripts/build_installer.py)
+src-tauri/sidecar/
+
+# Editor / OS
+.vscode/
+.idea/
+.zcode/
+Thumbs.db
+Desktop.ini
