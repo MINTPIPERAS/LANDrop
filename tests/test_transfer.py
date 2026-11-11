@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import errno
 import hashlib
-import io
-import os
 from pathlib import Path
 
 import paramiko
@@ -11,86 +8,7 @@ import pytest
 
 from landrop.transfer import TransferCancelled, TransferError, upload_file
 
-
-class RemoteFile(io.BytesIO):
-    def __init__(self, data: bytes, on_close=None):
-        super().__init__(data)
-        self._on_close = on_close
-
-    def close(self):
-        if not self.closed and self._on_close:
-            self._on_close(self.getvalue())
-        super().close()
-
-
-class FakeSFTP:
-    def __init__(self, files=None, *, posix_rename_supported=True):
-        self.files = dict(files or {})
-        self.opens = []
-        self.closed = False
-        self.posix_rename_supported = posix_rename_supported
-
-    def stat(self, path):
-        if path not in self.files:
-            raise OSError(errno.ENOENT, "No such file", path)
-        return type("Stat", (), {"st_size": len(self.files[path])})()
-
-    def open(self, path, mode):
-        self.opens.append((path, mode))
-        if mode == "rb":
-            if path not in self.files:
-                raise OSError(errno.ENOENT, "No such file", path)
-            return RemoteFile(self.files[path])
-        if mode == "ab":
-            initial = self.files.get(path, b"")
-            remote = RemoteFile(initial, lambda data: self.files.__setitem__(path, data))
-            remote.seek(0, io.SEEK_END)
-            return remote
-        raise AssertionError(f"Unexpected mode: {mode}")
-
-    def rename(self, old, new):
-        if new in self.files:
-            raise OSError(errno.EEXIST, "Target exists", new)
-        self.files[new] = self.files.pop(old)
-
-    def posix_rename(self, old, new):
-        if not self.posix_rename_supported:
-            raise paramiko.SSHException("extension unsupported")
-        self.files[new] = self.files.pop(old)
-
-    def close(self):
-        self.closed = True
-
-
-class FakeSSHClient:
-    def __init__(self, sftp, *, connect_error=None):
-        self.sftp = sftp
-        self.connect_error = connect_error
-        self.closed = False
-        self.loaded_system_keys = False
-        self.loaded_host_keys = []
-        self.policy = None
-        self.connect_args = None
-
-    def load_system_host_keys(self):
-        self.loaded_system_keys = True
-
-    def load_host_keys(self, path):
-        self.loaded_host_keys.append(path)
-
-    def set_missing_host_key_policy(self, policy):
-        self.policy = policy
-
-    def connect(self, **kwargs):
-        self.connect_args = kwargs
-        if self.connect_error:
-            raise self.connect_error
-
-    def open_sftp(self):
-        return self.sftp
-
-    def close(self):
-        self.closed = True
+from fake_sftp import FakeSFTP, FakeSSHClient
 
 
 def run_upload(tmp_path: Path, data: bytes, remote_files=None, **kwargs):
@@ -271,3 +189,129 @@ def test_progress_starts_at_resume_offset(tmp_path):
     assert updates[0] == (3, len(data))
     assert updates[-1] == (len(data), len(data))
     assert all(0 <= sent <= total for sent, total in updates)
+
+
+def test_missing_remote_directories_are_created(tmp_path):
+    _, _, sftp, _ = run_upload(tmp_path, b"data")
+
+    assert sftp.dirs == {"/home", "/home/alice", "/home/alice/Downloads"}
+    assert sftp.files["/home/alice/Downloads/payload.bin"] == b"data"
+
+
+def test_existing_remote_directory_is_left_untouched(tmp_path):
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"data")
+    sftp = FakeSFTP()
+    sftp.dirs.add("/home/alice/Downloads")
+    client = FakeSSHClient(sftp)
+
+    upload_file(
+        host="host", username="alice", local_path=local,
+        remote_dir="/home/alice/Downloads", client_factory=lambda: client,
+    )
+
+    assert sftp.dirs == {"/home/alice/Downloads"}
+
+
+def test_target_exists_carries_a_stable_error_code(tmp_path):
+    final = "/home/alice/Downloads/payload.bin"
+
+    with pytest.raises(TransferError) as excinfo:
+        run_upload(tmp_path, b"new", {final: b"old"})
+
+    assert excinfo.value.code == "target_exists"
+
+
+def test_hash_mismatch_carries_a_stable_error_code(tmp_path):
+    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+
+    with pytest.raises(TransferError) as excinfo:
+        run_upload(tmp_path, b"source data", {partial: b"other data"})
+
+    assert excinfo.value.code == "verify_failed"
+
+
+def test_authentication_failure_is_classified(tmp_path):
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"abc")
+    client = FakeSSHClient(
+        FakeSFTP(), connect_error=paramiko.AuthenticationException("denied")
+    )
+
+    with pytest.raises(TransferError) as excinfo:
+        upload_file(
+            host="host", username="alice", auth_method="password", password="secret",
+            local_path=local, remote_dir="/target", client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == "auth_failed"
+    assert client.closed
+
+
+def test_timeout_is_classified(tmp_path):
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"abc")
+    client = FakeSSHClient(FakeSFTP(), connect_error=TimeoutError("timed out"))
+
+    with pytest.raises(TransferError) as excinfo:
+        upload_file(
+            host="host", username="alice", local_path=local,
+            remote_dir="/target", client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == "timeout"
+
+
+def test_verify_progress_is_monotonic(tmp_path):
+    data = b"x" * 3_000_000
+    updates: list[tuple[int, int]] = []
+
+    run_upload(
+        tmp_path,
+        data,
+        verify_progress=lambda done, total: updates.append((done, total)),
+    )
+
+    assert updates[0] == (0, len(data))
+    assert updates[-1] == (len(data), len(data))
+    assert all(total == len(data) for _, total in updates)
+    values = [done for done, _ in updates]
+    assert values == sorted(values)
+
+
+def test_complete_partial_reports_verify_progress(tmp_path):
+    data = b"abcdefghij"
+    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    updates: list[tuple[int, int]] = []
+
+    run_upload(
+        tmp_path,
+        data,
+        {partial: data},
+        verify_progress=lambda done, total: updates.append((done, total)),
+    )
+
+    # The "checking resume" state now reports real progress instead of freezing.
+    assert updates
+    assert updates[-1] == (len(data), len(data))
+
+
+def test_stalled_channel_is_reported_as_timeout(tmp_path):
+    local = tmp_path / "payload.bin"
+    local.write_bytes(b"data")
+
+    class StallingSFTP(FakeSFTP):
+        def open(self, path, mode):
+            if mode == "ab":
+                raise TimeoutError("channel stalled")
+            return super().open(path, mode)
+
+    client = FakeSSHClient(StallingSFTP())
+
+    with pytest.raises(TransferError) as excinfo:
+        upload_file(
+            host="host", username="alice", local_path=local,
+            remote_dir="/target", client_factory=lambda: client,
+        )
+
+    assert excinfo.value.code == "timeout"

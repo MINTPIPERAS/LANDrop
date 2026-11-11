@@ -37,7 +37,7 @@ def test_round_trip_config(tmp_path) -> None:
 
     save_config(config, path)
 
-    assert load_config(path) == config
+    assert load_config(path) == config.normalized()
 
 
 def test_rejects_plaintext_password(tmp_path) -> None:

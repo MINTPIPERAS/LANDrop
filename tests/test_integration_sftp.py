@@ -9,7 +9,7 @@ import paramiko
 import pytest
 
 from landrop import hostkeys
-from landrop.transfer import TransferError, upload_file
+from landrop.transfer import TransferError, upload_file, upload_tree
 
 from sftp_server import LocalSftpServer
 
@@ -59,6 +59,25 @@ def test_real_upload_verifies_and_publishes(tmp_path, server) -> None:
     assert result.sha256 == sha256(source)
     assert final.read_bytes() == source.read_bytes()
     assert not (remote / "incoming" / "payload.bin.landrop.part").exists()
+
+
+def test_real_directory_upload_keeps_structure(tmp_path, server) -> None:
+    sftp, remote = server
+    known_hosts = sftp.write_known_hosts(tmp_path / "known_hosts")
+    source = tmp_path / "project"
+    (source / "images" / "raw").mkdir(parents=True)
+    (source / "empty").mkdir()
+    (source / "notes.txt").write_bytes(b"hello")
+    (source / "images" / "a.png").write_bytes(b"x" * 10)
+
+    result = upload_tree(**connect_kwargs(sftp, source, "/incoming", known_hosts))
+
+    assert result.ok_count == 2
+    assert result.failed_count == 0
+    assert (remote / "incoming" / "notes.txt").read_bytes() == b"hello"
+    assert (remote / "incoming" / "images" / "a.png").read_bytes() == b"x" * 10
+    assert (remote / "incoming" / "empty").is_dir()
+    assert not list((remote / "incoming").rglob("*.landrop.part"))
 
 
 def test_real_upload_resumes_from_partial(tmp_path, server) -> None:
