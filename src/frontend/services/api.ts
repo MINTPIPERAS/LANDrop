@@ -5,7 +5,7 @@ export type ServiceInfo = {
   token: string
 }
 
-export type TransferStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+export type TransferStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled'
 export type TransferPhase =
   | 'queued'
   | 'connecting'
@@ -13,14 +13,28 @@ export type TransferPhase =
   | 'transferring'
   | 'verifying'
   | 'completed'
+  | 'partial'
   | 'failed'
   | 'cancelled'
+
+export type TreeFileResult = {
+  rel_path: string
+  remote_path: string
+  size: number
+  ok: boolean
+  error: string | null
+  error_code: string | null
+}
 
 export type TransferResult = {
   remote_path: string
   size: number
-  sha256: string
+  sha256: string | null
   resumed_from: number
+  ok_count?: number
+  failed_count?: number
+  skipped?: { path: string; reason: string }[]
+  files?: TreeFileResult[]
 }
 
 export type TransferRequest = {
@@ -33,6 +47,7 @@ export type TransferRequest = {
   password?: string
   private_key_path?: string | null
   overwrite: boolean
+  recursive?: boolean
   remember_password?: boolean
 }
 
@@ -45,8 +60,24 @@ export type TransferSnapshot = {
   speed: number
   message: string
   error: string | null
+  error_code: string | null
+  current_file: string | null
+  files_done: number
+  files_total: number
+  verified: number
+  verify_total: number
+  created_at: number
+  source: 'manual' | 'schedule'
   result: TransferResult | null
   request: Omit<TransferRequest, 'password' | 'remember_password'>
+}
+
+export type ScanSummary = {
+  root: string
+  total_files: number
+  total_size: number
+  empty_dirs: number
+  skipped: { path: string; reason: string }[]
 }
 
 export type HostKeyInfo = {
@@ -55,6 +86,63 @@ export type HostKeyInfo = {
   key_type: string
   fingerprint: string
   trusted: boolean
+}
+
+export type DeviceConfig = {
+  id: string
+  name: string
+  host: string
+  port: number
+  username: string
+  remote_dir: string
+  auth_method: 'key' | 'password'
+  private_key_path: string
+}
+
+export type LogFileInfo = {
+  name: string
+  size: number
+  modified: number
+}
+
+export type LogSummary = {
+  dir: string
+  default_dir: string
+  files: LogFileInfo[]
+  total_size: number
+}
+
+export type ScheduleMode = 'once' | 'daily' | 'weekly'
+
+export type ScheduleConfig = {
+  id: string
+  name: string
+  enabled: boolean
+  source_path: string
+  recursive: boolean
+  device_id: string
+  remote_dir: string
+  overwrite: boolean
+  mode: ScheduleMode
+  time: string
+  date: string
+  weekdays: number[]
+  last_run_at: string
+  last_run_status: string
+}
+
+export type ScheduleStatus = {
+  id: string
+  next_run_at: string | null
+  missed: boolean
+  last_run_at: string
+  last_run_status: string
+  enabled: boolean
+}
+
+export type ScheduleStatusResponse = {
+  schedules: ScheduleStatus[]
+  system_tasks: boolean
 }
 
 export type SavedConfig = {
@@ -66,6 +154,12 @@ export type SavedConfig = {
   private_key_path: string
   hotkey_modifiers: string[]
   hotkey_key: string
+  devices: DeviceConfig[]
+  active_device_id: string
+  log_dir: string
+  log_retention_days: number
+  schedules: ScheduleConfig[]
+  close_to_tray: boolean
 }
 
 export class ApiError extends Error {
@@ -152,20 +246,49 @@ export function trustHostKey(host: string, port: number, fingerprint: string) {
   })
 }
 
-export function credentialStatus(username: string) {
-  return request<{ saved: boolean }>(`/api/credentials/${encodeURIComponent(username)}`)
+function credentialQuery(host: string, port: number, username: string): string {
+  return new URLSearchParams({ host, port: String(port), username }).toString()
 }
 
-export function saveCredential(username: string, password: string) {
+export function credentialStatus(host: string, port: number, username: string) {
+  return request<{ saved: boolean }>(`/api/credentials?${credentialQuery(host, port, username)}`)
+}
+
+export function saveCredential(host: string, port: number, username: string, password: string) {
   return request<{ saved: boolean }>('/api/credentials', {
     method: 'PUT',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ host, port, username, password }),
   })
 }
 
-export function deleteCredential(username: string) {
-  return request<{ deleted: boolean }>(`/api/credentials/${encodeURIComponent(username)}`, {
+export function deleteCredential(host: string, port: number, username: string) {
+  return request<{ deleted: boolean }>(`/api/credentials?${credentialQuery(host, port, username)}`, {
     method: 'DELETE',
+  })
+}
+
+export function scanDirectory(path: string) {
+  return request<ScanSummary>('/api/scan', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  })
+}
+
+export function getLogs() {
+  return request<LogSummary>('/api/logs')
+}
+
+export function openLogDir() {
+  return request<{ opened: boolean }>('/api/logs/open', { method: 'POST' })
+}
+
+export function getScheduleStatus() {
+  return request<ScheduleStatusResponse>('/api/schedules')
+}
+
+export function runSchedule(id: string) {
+  return request<TransferSnapshot>(`/api/schedules/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
   })
 }
 
@@ -178,6 +301,10 @@ export function createTransfer(payload: TransferRequest) {
 
 export function getTransfer(id: string) {
   return request<TransferSnapshot>(`/api/transfers/${id}`)
+}
+
+export function listTransfers(limit = 50) {
+  return request<{ tasks: TransferSnapshot[] }>(`/api/transfers?limit=${limit}`)
 }
 
 export function cancelTransfer(id: string) {

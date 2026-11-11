@@ -26,7 +26,7 @@ python -m pip install -e ".[dev]"
 npm run package
 ```
 
-产物：`src-tauri\target\release\bundle\nsis\LANDrop_0.1.0_x64-setup.exe`（约 19 MB）。
+产物：`src-tauri\target\release\bundle\nsis\LANDrop_0.2.0_x64-setup.exe`（约 19 MB）。
 
 打包分两步：PyInstaller 把 Python 服务打成 onedir 目录，再让 Tauri 收进安装包。首次打包 Tauri 需要从 GitHub 下载 NSIS，网络受限时见[技术实现](docs/技术实现.md)第 12.4 节。
 

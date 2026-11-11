@@ -2,16 +2,32 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import landrop.api.app as api
 from landrop.api.app import ServiceConfig, TransferManager, create_app
-from landrop.transfer import TransferCancelled, TransferError, TransferResult
+from landrop.config import DeviceConfig, ScheduleConfig
+from landrop.transfer import (
+    TransferCancelled,
+    TransferError,
+    TransferResult,
+    TreeFileResult,
+    TreeResult,
+)
 
 TOKEN = "a" * 48
 HEADERS = {"X-LANDrop-Token": TOKEN}
+
+
+@pytest.fixture(autouse=True)
+def isolate_log_directory(monkeypatch, tmp_path):
+    """Keep config-save side effects (log files) inside the test's tmp dir."""
+    monkeypatch.setattr(api.logs, "default_log_dir", lambda: tmp_path / "logs")
+    yield
+    api.logs.shutdown_logging()
 
 
 def make_client(manager: TransferManager | None = None, client=("127.0.0.1", 4567)):
@@ -316,7 +332,7 @@ def test_transfer_api_validates_payload_and_task_ids(tmp_path) -> None:
 def test_password_task_requires_password_or_stored_credential(tmp_path, monkeypatch) -> None:
     source = tmp_path / "need-password.bin"
     source.write_bytes(b"x")
-    monkeypatch.setattr(api.credentials, "load_password", lambda username: None)
+    monkeypatch.setattr(api.credentials, "load_password", lambda host, port, username: None)
     manager = TransferManager(max_workers=1)
     try:
         with make_client(manager) as client:
@@ -355,6 +371,198 @@ def test_config_round_trip_through_api(tmp_path, monkeypatch) -> None:
 
         assert client.put("/api/config", json={**payload, "port": 0}, headers=HEADERS).status_code == 422
         assert config_file.exists() is False
+
+
+def test_config_api_persists_devices(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(
+        api, "save_config", lambda config: captured.__setitem__("config", config)
+    )
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {
+                    "id": "home",
+                    "name": "家里台式机",
+                    "host": "192.168.1.20",
+                    "port": 2222,
+                    "username": "lin",
+                    "remote_dir": "/data",
+                    "auth_method": "password",
+                    "private_key_path": "",
+                }
+            ],
+            "active_device_id": "home",
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [device["id"] for device in body["devices"]] == ["home"]
+        assert body["active_device_id"] == "home"
+        # Flat fields mirror the active device for older readers.
+        assert body["host"] == "192.168.1.20"
+        assert body["port"] == 2222
+
+    saved = captured["config"]
+    assert isinstance(saved, api.AppConfig)
+    assert saved.devices[0].name == "家里台式机"
+
+
+def test_config_api_rejects_duplicate_device_ids(monkeypatch) -> None:
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {"id": "dup", "host": "one"},
+                {"id": "dup", "host": "two"},
+            ]
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 400
+        assert "重复" in response.json()["detail"]
+
+
+def test_directory_transfer_reports_partial_results(tmp_path, monkeypatch) -> None:
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    (folder / "a.txt").write_bytes(b"aaaa")
+
+    def fake_upload_tree(**kwargs):
+        kwargs["file_progress"]("a.txt", 1, 2)
+        kwargs["progress"](10, 10)
+        return TreeResult(
+            local_root=folder,
+            remote_root="/incoming",
+            files=(
+                TreeFileResult("a.txt", "/incoming/a.txt", 4, True),
+                TreeFileResult(
+                    "b.txt", "/incoming/b.txt", 6, False, "远端目标文件已存在", "target_exists"
+                ),
+            ),
+            ok_count=1,
+            failed_count=1,
+            skipped=(),
+            size=10,
+        )
+
+    monkeypatch.setattr(api, "upload_tree", fake_upload_tree)
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            response = client.post(
+                "/api/transfers", json=base_payload(folder, recursive=True), headers=HEADERS
+            )
+            assert response.status_code == 202
+
+            snapshot = wait_for_status(
+                client, response.json()["id"], {"partial", "succeeded", "failed"}
+            )
+
+            assert snapshot["status"] == "partial"
+            assert snapshot["request"]["recursive"] is True
+            assert snapshot["result"]["ok_count"] == 1
+            assert snapshot["result"]["failed_count"] == 1
+            assert snapshot["result"]["files"][1]["error_code"] == "target_exists"
+    finally:
+        manager.close()
+
+
+def test_directory_transfer_succeeds_when_every_file_lands(tmp_path, monkeypatch) -> None:
+    folder = tmp_path / "all-good"
+    folder.mkdir()
+    (folder / "a.txt").write_bytes(b"a")
+
+    def fake_upload_tree(**kwargs):
+        kwargs["file_progress"]("a.txt", 1, 1)
+        kwargs["progress"](1, 1)
+        return TreeResult(
+            local_root=folder,
+            remote_root="/incoming",
+            files=(TreeFileResult("a.txt", "/incoming/a.txt", 1, True),),
+            ok_count=1,
+            failed_count=0,
+            skipped=(),
+            size=1,
+        )
+
+    monkeypatch.setattr(api, "upload_tree", fake_upload_tree)
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            response = client.post(
+                "/api/transfers", json=base_payload(folder, recursive=True), headers=HEADERS
+            )
+            snapshot = wait_for_status(
+                client, response.json()["id"], {"partial", "succeeded", "failed"}
+            )
+
+            assert snapshot["status"] == "succeeded"
+            assert snapshot["files_done"] == 1
+            assert snapshot["files_total"] == 1
+            assert snapshot["result"]["failed_count"] == 0
+    finally:
+        manager.close()
+
+
+def test_recursive_transfer_requires_a_folder(tmp_path) -> None:
+    source = tmp_path / "one.bin"
+    source.write_bytes(b"x")
+
+    with make_client() as client:
+        response = client.post(
+            "/api/transfers", json=base_payload(source, recursive=True), headers=HEADERS
+        )
+
+        assert response.status_code == 400
+        assert "文件夹" in response.json()["detail"]
+
+
+def test_failed_task_exposes_the_error_code(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"x")
+
+    def fake_upload_file(**kwargs):
+        raise TransferError("远端目标文件已存在", code="target_exists")
+
+    monkeypatch.setattr(api, "upload_file", fake_upload_file)
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            response = client.post("/api/transfers", json=base_payload(source), headers=HEADERS)
+            snapshot = wait_for_status(client, response.json()["id"], {"failed"})
+
+            assert snapshot["error_code"] == "target_exists"
+            assert snapshot["error"] == "远端目标文件已存在"
+    finally:
+        manager.close()
+
+
+def test_scan_endpoint_summarizes_a_folder(tmp_path) -> None:
+    root = tmp_path / "incoming"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "a.bin").write_bytes(b"12345")
+    (root / "empty").mkdir()
+
+    with make_client() as client:
+        response = client.post("/api/scan", json={"path": str(root)}, headers=HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total_files"] == 1
+        assert body["total_size"] == 5
+        assert body["empty_dirs"] == 1
+        assert body["skipped"] == []
+
+        missing = client.post(
+            "/api/scan", json={"path": str(tmp_path / "missing")}, headers=HEADERS
+        )
+        assert missing.status_code == 400
 
 
 def test_config_api_normalizes_hotkey(monkeypatch) -> None:
@@ -421,3 +629,413 @@ def test_config_api_rejects_hotkey_without_modifier(monkeypatch) -> None:
 
     assert response.status_code == 400
     assert "修饰键" in response.json()["detail"]
+
+
+def test_logs_endpoint_lists_files(tmp_path, monkeypatch) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "landrop.log").write_text("abcd", encoding="utf-8")
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig(log_dir=str(log_dir)))
+
+    with make_client() as client:
+        response = client.get("/api/logs", headers=HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["dir"] == str(log_dir)
+        assert body["total_size"] == 4
+        assert body["files"][0]["name"] == "landrop.log"
+
+
+def test_logs_open_endpoint_uses_the_configured_directory(tmp_path, monkeypatch) -> None:
+    opened: list[Path] = []
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig(log_dir=str(tmp_path)))
+    monkeypatch.setattr(
+        api.logs, "open_directory", lambda directory: opened.append(directory) or True
+    )
+
+    with make_client() as client:
+        response = client.post("/api/logs/open", headers=HEADERS)
+
+        assert response.json() == {"opened": True}
+    assert opened == [tmp_path]
+
+
+def test_saving_config_reconfigures_logging_and_purges(tmp_path, monkeypatch) -> None:
+    configured: list[str] = []
+    purged: list[tuple[Path, int]] = []
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+    monkeypatch.setattr(
+        api.logs,
+        "configure_logging",
+        lambda value="", **kwargs: configured.append(value) or tmp_path,
+    )
+    monkeypatch.setattr(
+        api.logs,
+        "purge",
+        lambda directory, days: purged.append((directory, days)) or [],
+    )
+
+    with make_client() as client:
+        payload = {"log_dir": str(tmp_path), "log_retention_days": 7}
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["log_retention_days"] == 7
+
+    assert configured == [str(tmp_path)]
+    assert purged == [(tmp_path, 7)]
+
+
+def test_saving_config_rejects_a_relative_log_directory(monkeypatch) -> None:
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+
+    with make_client() as client:
+        response = client.put(
+            "/api/config", json={"log_dir": "relative/logs"}, headers=HEADERS
+        )
+
+        assert response.status_code == 400
+        assert "绝对路径" in response.json()["detail"]
+
+
+def schedule_payload(source: Path, device: dict, **overrides) -> dict:
+    values = {
+        "id": "s1",
+        "name": "备份",
+        "enabled": True,
+        "source_path": str(source),
+        "recursive": False,
+        "device_id": device["id"],
+        "remote_dir": "",
+        "overwrite": False,
+        "mode": "daily",
+        "time": "09:00",
+        "date": "",
+        "weekdays": [],
+    }
+    values.update(overrides)
+    return values
+
+
+def key_device(**overrides) -> dict:
+    values = {
+        "id": "d1",
+        "name": "家里",
+        "host": "192.168.1.9",
+        "port": 22,
+        "username": "lin",
+        "remote_dir": "/incoming",
+        "auth_method": "key",
+        "private_key_path": "",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_saving_config_syncs_system_tasks(tmp_path, monkeypatch) -> None:
+    synced: list[list] = []
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+    monkeypatch.setattr(
+        api.scheduler, "sync_tasks", lambda schedules: synced.append(list(schedules)) or []
+    )
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    device = key_device()
+
+    with make_client() as client:
+        payload = {"devices": [device], "schedules": [schedule_payload(source, device)]}
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["schedules"][0]["id"] == "s1"
+
+    assert len(synced) == 1
+    assert synced[0][0].id == "s1"
+
+
+def test_schedule_with_missing_source_is_rejected(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+    device = key_device()
+
+    with make_client() as client:
+        payload = {
+            "devices": [device],
+            "schedules": [schedule_payload(tmp_path / "missing.bin", device)],
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 400
+        assert "来源不存在" in response.json()["detail"]
+
+
+def test_password_schedule_requires_a_saved_credential(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+    monkeypatch.setattr(api.credentials, "has_password", lambda host, port, user: False)
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    device = key_device(auth_method="password")
+
+    with make_client() as client:
+        payload = {"devices": [device], "schedules": [schedule_payload(source, device)]}
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 400
+        assert "保存密码" in response.json()["detail"]
+
+
+def test_schedule_status_reports_next_run(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    config = api.AppConfig(
+        devices=(DeviceConfig(id="d1", host="h", username="u", auth_method="key"),),
+        schedules=(
+            ScheduleConfig(
+                id="s1", source_path=str(source), device_id="d1", mode="daily", time="00:00"
+            ),
+        ),
+    )
+    monkeypatch.setattr(api, "load_config", lambda: config)
+
+    with make_client() as client:
+        response = client.get("/api/schedules", headers=HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["schedules"][0]["id"] == "s1"
+        assert body["schedules"][0]["next_run_at"]
+        assert isinstance(body["schedules"][0]["missed"], bool)
+        assert body["schedules"][0]["last_run_at"] == ""
+        assert body["schedules"][0]["enabled"] is True
+        assert "system_tasks" in body
+
+
+def test_run_schedule_endpoint_dispatches(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    config = api.AppConfig(
+        devices=(DeviceConfig(id="d1", host="h", username="u", auth_method="key"),),
+        schedules=(
+            ScheduleConfig(id="s1", source_path=str(source), device_id="d1", mode="daily"),
+        ),
+    )
+
+    class FakeTask:
+        def snapshot(self) -> dict:
+            return {"id": "task-1", "status": "queued"}
+
+    monkeypatch.setattr(api, "load_config", lambda: config)
+    monkeypatch.setattr(
+        api.scheduler, "dispatch_schedule", lambda manager, cfg, item: FakeTask()
+    )
+
+    with make_client() as client:
+        response = client.post("/api/schedules/s1/run", headers=HEADERS)
+        assert response.status_code == 202
+        assert response.json()["id"] == "task-1"
+
+        missing = client.post("/api/schedules/nope/run", headers=HEADERS)
+        assert missing.status_code == 404
+
+
+def test_run_endpoint_creates_a_real_transfer_task(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"abc")
+    config = api.AppConfig(
+        devices=(
+            DeviceConfig(id="d1", host="h", username="u", auth_method="key", remote_dir="/incoming"),
+        ),
+        schedules=(
+            ScheduleConfig(id="s1", source_path=str(source), device_id="d1", mode="daily"),
+        ),
+    )
+    recorded: list[str] = []
+    monkeypatch.setattr(api, "load_config", lambda: config)
+    monkeypatch.setattr(
+        api.scheduler, "save_run_result", lambda sid, status, when=None: recorded.append(status)
+    )
+    monkeypatch.setattr(
+        api,
+        "upload_file",
+        lambda **kwargs: TransferResult(source, "/incoming/a.bin", 3, "f" * 64, 0),
+    )
+
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            response = client.post("/api/schedules/s1/run", headers=HEADERS)
+            assert response.status_code == 202
+
+            snapshot = wait_for_status(
+                client, response.json()["id"], {"succeeded", "partial", "failed"}
+            )
+            assert snapshot["status"] == "succeeded"
+            assert snapshot["source"] == "schedule"
+    finally:
+        manager.close()
+
+    # The dispatch records "running" synchronously; the watcher adds the outcome.
+    assert recorded[0] == "running"
+
+
+def test_cli_schedule_argument_parsing() -> None:
+    assert api._schedule_argument([]) is None
+    assert api._schedule_argument(["--run-schedule", "s1"]) == "s1"
+    assert api._schedule_argument(["--run-schedule"]) == ""
+
+
+def test_list_transfers_returns_tasks_and_applies_limit(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(
+        api,
+        "upload_file",
+        lambda **kwargs: TransferResult(source, "/remote/payload.bin", 1, "f" * 64, 0),
+    )
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            first = client.post("/api/transfers", json=base_payload(source), headers=HEADERS).json()
+            second = client.post("/api/transfers", json=base_payload(source), headers=HEADERS).json()
+
+            listed = client.get("/api/transfers", headers=HEADERS)
+            assert listed.status_code == 200
+            tasks = listed.json()["tasks"]
+            assert {task["id"] for task in tasks} >= {first["id"], second["id"]}
+            assert tasks[0]["created_at"] >= tasks[-1]["created_at"]
+            assert tasks[0]["source"] in {"manual", "schedule"}
+            assert tasks[0]["verified"] == 0
+            assert tasks[0]["verify_total"] == 0
+
+            limited = client.get("/api/transfers?limit=1", headers=HEADERS).json()["tasks"]
+            assert len(limited) == 1
+    finally:
+        manager.close()
+
+
+def test_saving_config_preserves_scheduler_run_state(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    current = api.AppConfig(
+        devices=(
+            DeviceConfig(id="d1", host="h", username="u", auth_method="key", remote_dir="/in"),
+        ),
+        schedules=(
+            ScheduleConfig(
+                id="s1", source_path=str(source), device_id="d1", mode="daily", time="09:00",
+                last_run_at="2026-11-09T09:00:05", last_run_status="succeeded",
+            ),
+        ),
+    )
+    saved: dict[str, object] = {}
+    monkeypatch.setattr(api, "load_config", lambda: current)
+    monkeypatch.setattr(
+        api, "save_config", lambda config: saved.__setitem__("config", config)
+    )
+    monkeypatch.setattr(api.scheduler, "sync_tasks", lambda schedules: [])
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {
+                    "id": "d1", "host": "h", "username": "u", "auth_method": "key",
+                    "remote_dir": "/in", "private_key_path": "",
+                }
+            ],
+            "schedules": [
+                {
+                    "id": "s1", "source_path": str(source), "device_id": "d1",
+                    "mode": "daily", "time": "09:00", "enabled": True,
+                    "last_run_at": "", "last_run_status": "",
+                }
+            ],
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        body = response.json()["schedules"][0]
+        # The stale client values must not erase what the scheduler recorded.
+        assert body["last_run_at"] == "2026-11-09T09:00:05"
+        assert body["last_run_status"] == "succeeded"
+
+    config = saved["config"]
+    assert isinstance(config, api.AppConfig)
+    assert config.schedules[0].last_run_at == "2026-11-09T09:00:05"
+
+
+def test_finished_one_shot_stays_disabled(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    current = api.AppConfig(
+        devices=(
+            DeviceConfig(id="d1", host="h", username="u", auth_method="key", remote_dir="/in"),
+        ),
+        schedules=(
+            ScheduleConfig(
+                id="s1", source_path=str(source), device_id="d1", mode="once",
+                time="09:00", date="2026-11-01", enabled=False,
+                last_run_at="2026-11-01T09:00:07", last_run_status="succeeded",
+            ),
+        ),
+    )
+    saved: dict[str, object] = {}
+    monkeypatch.setattr(api, "load_config", lambda: current)
+    monkeypatch.setattr(api, "save_config", lambda config: saved.__setitem__("config", config))
+    monkeypatch.setattr(api.scheduler, "sync_tasks", lambda schedules: [])
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {
+                    "id": "d1", "host": "h", "username": "u", "auth_method": "key",
+                    "remote_dir": "/in", "private_key_path": "",
+                }
+            ],
+            "schedules": [
+                {
+                    "id": "s1", "source_path": str(source), "device_id": "d1",
+                    "mode": "once", "time": "09:00", "date": "2026-11-01", "enabled": True,
+                }
+            ],
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["schedules"][0]["enabled"] is False
+
+    config = saved["config"]
+    assert isinstance(config, api.AppConfig)
+    assert config.schedules[0].enabled is False
+
+
+def test_past_one_shot_schedule_is_rejected(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "a.bin"
+    source.write_bytes(b"x")
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    monkeypatch.setattr(api, "save_config", lambda config: None)
+    monkeypatch.setattr(api.scheduler, "sync_tasks", lambda schedules: [])
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {
+                    "id": "d1", "host": "h", "username": "u", "auth_method": "key",
+                    "remote_dir": "/in", "private_key_path": "",
+                }
+            ],
+            "schedules": [
+                {
+                    "id": "s1", "source_path": str(source), "device_id": "d1",
+                    "mode": "once", "time": "09:00", "date": "2026-11-01", "enabled": True,
+                }
+            ],
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 400
+        assert "已经过去" in response.json()["detail"]
