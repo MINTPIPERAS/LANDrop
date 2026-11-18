@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from landrop.transfer.scan import scan_directory
+from irecon.transfer.scan import scan_directory
 
 
 def make_tree(tmp_path: Path) -> Path:

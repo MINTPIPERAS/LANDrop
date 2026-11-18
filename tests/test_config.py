@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from landrop.config import (
+from irecon.config import (
     AppConfig,
     load_config,
     normalize_key,

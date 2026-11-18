@@ -42,6 +42,7 @@ export type TransferRequest = {
   port: number
   username: string
   remote_dir: string
+  remote_name?: string | null
   local_path: string
   auth_method: 'key' | 'password'
   password?: string
@@ -78,6 +79,32 @@ export type ScanSummary = {
   total_size: number
   empty_dirs: number
   skipped: { path: string; reason: string }[]
+}
+
+export type FsEntry = {
+  name: string
+  path: string
+  is_dir: boolean
+  is_symlink: boolean
+  hidden: boolean
+  size: number | null
+  modified: number
+  created: number
+}
+
+export type FsListing = {
+  path: string
+  parent: string | null
+  entries: FsEntry[]
+  total: number
+  truncated: boolean
+  skipped: { path: string; reason: string }[]
+}
+
+export type FsRoot = {
+  label: string
+  path: string
+  kind: string
 }
 
 export type HostKeyInfo = {
@@ -122,6 +149,7 @@ export type ScheduleConfig = {
   recursive: boolean
   device_id: string
   remote_dir: string
+  remote_name?: string
   overwrite: boolean
   mode: ScheduleMode
   time: string
@@ -194,7 +222,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       ...init,
       headers: {
         'Content-Type': 'application/json',
-        'X-LANDrop-Token': service.token,
+        'X-iRecon-Token': service.token,
         ...(init.headers ?? {}),
       },
     })
@@ -274,6 +302,16 @@ export function scanDirectory(path: string) {
   })
 }
 
+export function listDirectory(path: string, limit = 20000) {
+  return request<FsListing>(
+    `/api/fs/list?path=${encodeURIComponent(path)}&limit=${limit}`,
+  )
+}
+
+export function listRoots() {
+  return request<{ roots: FsRoot[] }>('/api/fs/roots')
+}
+
 export function getLogs() {
   return request<LogSummary>('/api/logs')
 }
@@ -311,10 +349,13 @@ export function cancelTransfer(id: string) {
   return request<TransferSnapshot>(`/api/transfers/${id}/cancel`, { method: 'POST' })
 }
 
-export function retryTransfer(id: string, password?: string) {
+export function retryTransfer(id: string, password?: string, overwrite?: boolean) {
   return request<TransferSnapshot>(`/api/transfers/${id}/retry`, {
     method: 'POST',
-    body: JSON.stringify(password ? { password } : {}),
+    body: JSON.stringify({
+      ...(password ? { password } : {}),
+      ...(overwrite ? { overwrite: true } : {}),
+    }),
   })
 }
 
@@ -343,7 +384,7 @@ export function subscribeTransfer(
       const service = await ensureService()
       const response = await fetch(`${service.baseUrl}/api/transfers/${id}/events`, {
         headers: {
-          'X-LANDrop-Token': service.token,
+          'X-iRecon-Token': service.token,
           ...(lastEventId ? { 'Last-Event-ID': String(lastEventId) } : {}),
         },
         signal: controller.signal,

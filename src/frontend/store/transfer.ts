@@ -86,6 +86,7 @@ export type LocalSource = {
 /** A queued source plus the outcome of its last attempt. */
 export type QueuedSource = LocalSource & {
   key: string
+  remoteName?: string
   overwrite?: boolean
   error?: string | null
   errorCode?: string | null
@@ -139,6 +140,7 @@ export type ScheduleDraft = {
   recursive: boolean
   deviceId: string
   remoteDir: string
+  remoteName: string
   overwrite: boolean
   mode: ScheduleMode
   time: string
@@ -152,6 +154,7 @@ export const scheduleDraft = reactive<ScheduleDraft>({
   recursive: false,
   deviceId: '',
   remoteDir: '',
+  remoteName: '',
   overwrite: false,
   mode: 'daily',
   time: '09:00',
@@ -187,13 +190,25 @@ export const canSend = computed(() => {
   )
 })
 
+/** First invalid folder name in the queue, if any. */
+export const invalidQueueRemoteName = computed(() => {
+  for (const item of queue.value) {
+    if (item.kind !== 'folder') continue
+    const name = item.remoteName?.trim() || defaultRemoteFolderName(item.path)
+    const error = validateRemoteName(name)
+    if (error) return `${fileName(item.path)}：${error}`
+  }
+  return ''
+})
+
 /** Why the send button is disabled, in plain language; empty when ready. */
 export const sendBlockReason = computed(() => {
   if (serviceState.value === 'connecting') return '应用还在启动，请稍等几秒'
   if (serviceState.value === 'error') return '本机服务未启动，请重新打开应用'
   if (isLocked.value) return '正在发送，请等待这一批完成'
   if (busy.value) return '正在处理，请稍候'
-  if (!queue.value.length) return '请先选择要发送的文件'
+  if (!queue.value.length) return '请添加文件或文件夹；两者可以一起添加'
+  if (invalidQueueRemoteName.value) return invalidQueueRemoteName.value
   if (!form.host.trim()) return '请先填写对方电脑的 IP 地址'
   if (!form.username.trim()) return '请先填写对方电脑的用户名'
   if (!form.remoteDir.trim()) return '请先设置文件保存位置'
@@ -212,6 +227,37 @@ export const hasTargetConflicts = computed(() =>
 
 export function fileName(path: string | null): string {
   return path?.split(/[\\/]/).pop() ?? ''
+}
+
+function localFolderName(path: string): string {
+  return fileName(path.replace(/[\\/]+$/, '')) || 'folder'
+}
+
+/** Default remote folder name for a manual folder transfer. */
+export function defaultRemoteFolderName(path: string): string {
+  return `${todayIso()}_${localFolderName(path)}`
+}
+
+/** Default schedule template; ``{date}`` is rendered on each run. */
+export function defaultScheduleFolderName(path: string): string {
+  return `{date}_${localFolderName(path)}`
+}
+
+/** Return a user-facing error for an invalid remote folder name. */
+export function validateRemoteName(raw: string, allowDateToken = false): string | null {
+  let name = raw.trim()
+  if (!name) return '请输入远端文件夹名'
+  if (allowDateToken) name = name.split('{date}').join('2000-01-01')
+  if (name.length > 255) return '远端文件夹名不能超过 255 个字符'
+  if (name === '.' || name === '..') return '远端文件夹名不能是 . 或 ..'
+  if (/[\\/]/.test(name)) return '远端文件夹名不能包含 / 或 \\'
+  if (/[\u0000-\u001f]/.test(name)) return '远端文件夹名不能包含控制字符'
+  if (/[<>:"|?*]/.test(name)) return '远端文件夹名不能包含 < > : " | ? *'
+  if (name.endsWith('.')) return '远端文件夹名不能以点结尾'
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name)) {
+    return '远端文件夹名不能使用 Windows 保留名称'
+  }
+  return null
 }
 
 function sourceKey(path: string): string {
@@ -233,10 +279,13 @@ export function addFiles(paths: string[]): number {
 }
 
 /** Append a folder, reading its size first so the queue can show the volume. */
-export async function addFolder(path: string): Promise<string | null> {
+export async function addFolder(path: string, remoteName?: string): Promise<string | null> {
   const key = sourceKey(path)
   if (!key) return '无效的文件夹路径'
   if (queue.value.some(item => item.key === key)) return null
+  const name = remoteName?.trim() || defaultRemoteFolderName(path)
+  const nameError = validateRemoteName(name)
+  if (nameError) return nameError
   try {
     const summary = await scanDirectory(path)
     queue.value.push({
@@ -245,10 +294,18 @@ export async function addFolder(path: string): Promise<string | null> {
       kind: 'folder',
       size: summary.total_size,
       fileCount: summary.total_files,
+      remoteName: name,
     })
     return null
   } catch (error) {
-    queue.value.push({ key, path, kind: 'folder', size: 0, fileCount: 0 })
+    queue.value.push({
+      key,
+      path,
+      kind: 'folder',
+      size: 0,
+      fileCount: 0,
+      remoteName: name,
+    })
     return error instanceof Error ? error.message : '无法读取文件夹内容'
   }
 }
@@ -374,7 +431,8 @@ const ERROR_HINTS: Record<string, string> = {
   host_key_changed: '对方电脑的身份和上次不一致，已停止发送。请重新验证对方电脑身份。',
   timeout: '连接对方电脑超时，请确认两台电脑在同一个网络，并且对方已允许远程连接。',
   network_error: '网络连接中断了，请检查网络后点「重新发送」。',
-  target_exists: '对方电脑上已经有同名文件。可以点「覆盖并重发」。',
+  remote_io: '对方电脑上的文件操作失败，请检查目标目录是否存在、是否有写入权限或磁盘空间不足。',
+  target_exists: '对方电脑上已经有同名文件。可以点「覆盖重试」或「覆盖并重发」。',
   verify_failed: '文件发送后核对不一致，请点「重新发送」再试一次。',
   state_conflict: '对方电脑上还有上次未完成的临时文件，请稍后再试。',
   local_changed: '文件在发送过程中被修改了，请重新选择文件。',
@@ -770,7 +828,7 @@ export async function updateSystemSettings(): Promise<string | null> {
   return error
 }
 
-function todayIso(): string {
+export function todayIso(): string {
   const now = new Date()
   const month = String(now.getMonth() + 1).padStart(2, '0')
   const day = String(now.getDate()).padStart(2, '0')
@@ -795,6 +853,7 @@ export function resetScheduleDraft() {
   scheduleDraft.recursive = false
   scheduleDraft.deviceId = activeDeviceId.value || devices.value[0]?.id || ''
   scheduleDraft.remoteDir = ''
+  scheduleDraft.remoteName = ''
   scheduleDraft.overwrite = false
   scheduleDraft.mode = 'daily'
   scheduleDraft.time = '09:00'
@@ -811,6 +870,13 @@ export async function addSchedule(): Promise<string | null> {
   if (scheduleDraft.mode === 'weekly' && !scheduleDraft.weekdays.length) {
     return '每周任务至少选择一天'
   }
+  const remoteName = scheduleDraft.recursive
+    ? scheduleDraft.remoteName.trim() || defaultScheduleFolderName(source)
+    : ''
+  if (scheduleDraft.recursive) {
+    const nameError = validateRemoteName(remoteName, true)
+    if (nameError) return nameError
+  }
 
   const item: ScheduleConfig = {
     id: newScheduleId(),
@@ -820,6 +886,7 @@ export async function addSchedule(): Promise<string | null> {
     recursive: scheduleDraft.recursive,
     device_id: scheduleDraft.deviceId,
     remote_dir: scheduleDraft.remoteDir.trim(),
+    remote_name: remoteName,
     overwrite: scheduleDraft.overwrite,
     mode: scheduleDraft.mode,
     time: scheduleDraft.time || '09:00',
@@ -988,12 +1055,19 @@ export async function confirmHostKey() {
 }
 
 /** Build the request for one source; folders switch the backend to tree mode. */
-export function transferPayload(source: LocalSource & { overwrite?: boolean }): TransferRequest {
+export function transferPayload(
+  source: LocalSource & { overwrite?: boolean; remoteName?: string },
+): TransferRequest {
+  const folderName =
+    source.kind === 'folder'
+      ? source.remoteName?.trim() || defaultRemoteFolderName(source.path)
+      : undefined
   return {
     host: form.host.trim(),
     port: Number(form.port) || 22,
     username: form.username.trim(),
     remote_dir: form.remoteDir.trim(),
+    remote_name: folderName,
     local_path: source.path,
     auth_method: form.authMethod,
     password: form.authMethod === 'password' ? form.password || undefined : undefined,
@@ -1110,13 +1184,14 @@ export async function cancelActive() {
   }
 }
 
-export async function retryActive() {
+export async function retryActive(overwrite?: boolean) {
   if (!activeTaskId.value) return
   busy.value = true
   try {
     const task = await retryTransfer(
       activeTaskId.value,
       form.authMethod === 'password' ? form.password || undefined : undefined,
+      overwrite,
     )
     activeTaskId.value = task.id
     upsert(task)

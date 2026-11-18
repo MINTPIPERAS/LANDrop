@@ -1,12 +1,12 @@
 [package]
-name = "landrop-desktop"
-version = "0.2.0"
-description = "LANDrop desktop shell"
-authors = ["LANDrop"]
+name = "irecon-desktop"
+version = "0.4.8"
+description = "iRecon desktop shell"
+authors = ["iRecon"]
 edition = "2021"
 
 [lib]
-name = "landrop_desktop_lib"
+name = "irecon_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

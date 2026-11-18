@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from landrop import credentials
+from irecon import credentials
 
 
 @pytest.fixture
@@ -28,8 +28,8 @@ def store(monkeypatch) -> dict[str, str]:
 
 
 def test_target_scopes_host_port_and_keeps_username_case() -> None:
-    assert credentials._target("192.168.1.5", 22, "lin") == "LANDrop/192.168.1.5:22/lin"
-    assert credentials._target(" NAS.LAN ", 2222, "Lin") == "LANDrop/nas.lan:2222/Lin"
+    assert credentials._target("192.168.1.5", 22, "lin") == "iRecon/192.168.1.5:22/lin"
+    assert credentials._target(" NAS.LAN ", 2222, "Lin") == "iRecon/nas.lan:2222/Lin"
 
 
 def test_same_username_on_two_hosts_keeps_separate_passwords(store) -> None:
@@ -50,23 +50,23 @@ def test_same_host_on_two_ports_stays_separate(store) -> None:
 
 
 def test_legacy_entry_is_read_then_migrated(store) -> None:
-    store["LANDrop/lin"] = "legacy-secret"
+    store["iRecon/lin"] = "legacy-secret"
 
     assert credentials.load_password("192.168.1.5", 22, "lin") == "legacy-secret"
-    assert store["LANDrop/192.168.1.5:22/lin"] == "legacy-secret"
+    assert store["iRecon/192.168.1.5:22/lin"] == "legacy-secret"
     # The legacy entry stays readable for older builds.
-    assert store["LANDrop/lin"] == "legacy-secret"
+    assert store["iRecon/lin"] == "legacy-secret"
 
 
 def test_host_scoped_entry_wins_over_legacy(store) -> None:
-    store["LANDrop/lin"] = "legacy-secret"
-    store["LANDrop/192.168.1.5:22/lin"] = "current-secret"
+    store["iRecon/lin"] = "legacy-secret"
+    store["iRecon/192.168.1.5:22/lin"] = "current-secret"
 
     assert credentials.load_password("192.168.1.5", 22, "lin") == "current-secret"
 
 
 def test_legacy_migration_failure_still_returns_the_password(store, monkeypatch) -> None:
-    store["LANDrop/lin"] = "legacy-secret"
+    store["iRecon/lin"] = "legacy-secret"
 
     def failing_write(target: str, username: str, password: str) -> None:
         raise credentials.CredentialError("boom")
@@ -76,7 +76,7 @@ def test_legacy_migration_failure_still_returns_the_password(store, monkeypatch)
 
 
 def test_delete_removes_legacy_copy_so_it_cannot_resurrect(store) -> None:
-    store["LANDrop/lin"] = "legacy-secret"
+    store["iRecon/lin"] = "legacy-secret"
     assert credentials.load_password("192.168.1.5", 22, "lin") == "legacy-secret"
 
     assert credentials.delete_password("192.168.1.5", 22, "lin") is True

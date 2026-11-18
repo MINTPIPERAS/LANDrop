@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Build the Python transfer service as a ``onedir`` sidecar for the Tauri app.
 
-The Tauri shell looks for ``landrop-service/landrop-service.exe`` next to its own
-executable, so the output directory name here must stay ``landrop-service``.
+The Tauri shell looks for ``irecon-service/irecon-service.exe`` next to its own
+executable, so the output directory name here must stay ``irecon-service``.
 Build with::
 
-    python -m PyInstaller --noconfirm landrop-service.spec
+    python -m PyInstaller --noconfirm irecon-service.spec
 """
 
 from pathlib import Path
@@ -38,10 +38,10 @@ hiddenimports = [
     "cryptography",
     "nacl",
 ]
-hiddenimports += collect_submodules("landrop")
+hiddenimports += collect_submodules("irecon")
 
 a = Analysis(  # noqa: F821
-    [str(ROOT / "src" / "landrop" / "api" / "app.py")],
+    [str(ROOT / "src" / "irecon" / "api" / "app.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
     datas=[],
@@ -91,7 +91,7 @@ exe = EXE(  # noqa: F821
     a.scripts,
     [],
     exclude_binaries=True,
-    name="landrop-service",
+    name="irecon-service",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -116,5 +116,5 @@ coll = COLLECT(  # noqa: F821
     upx=False,
     upx_exclude=[],
     # Must match what src-tauri/src/service.rs looks for.
-    name="landrop-service",
+    name="irecon-service",
 )

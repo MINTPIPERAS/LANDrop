@@ -8,8 +8,8 @@ from pathlib import Path
 import paramiko
 import pytest
 
-from landrop import hostkeys
-from landrop.transfer import TransferError, upload_file, upload_tree
+from irecon import hostkeys
+from irecon.transfer import TransferError, upload_file, upload_tree
 
 from sftp_server import LocalSftpServer
 
@@ -58,7 +58,7 @@ def test_real_upload_verifies_and_publishes(tmp_path, server) -> None:
     assert final.is_file()
     assert result.sha256 == sha256(source)
     assert final.read_bytes() == source.read_bytes()
-    assert not (remote / "incoming" / "payload.bin.landrop.part").exists()
+    assert not (remote / "incoming" / "payload.bin.irecon.part").exists()
 
 
 def test_real_directory_upload_keeps_structure(tmp_path, server) -> None:
@@ -70,14 +70,17 @@ def test_real_directory_upload_keeps_structure(tmp_path, server) -> None:
     (source / "notes.txt").write_bytes(b"hello")
     (source / "images" / "a.png").write_bytes(b"x" * 10)
 
-    result = upload_tree(**connect_kwargs(sftp, source, "/incoming", known_hosts))
+    result = upload_tree(
+        **connect_kwargs(sftp, source, "/incoming", known_hosts, remote_name="project")
+    )
 
     assert result.ok_count == 2
     assert result.failed_count == 0
-    assert (remote / "incoming" / "notes.txt").read_bytes() == b"hello"
-    assert (remote / "incoming" / "images" / "a.png").read_bytes() == b"x" * 10
-    assert (remote / "incoming" / "empty").is_dir()
-    assert not list((remote / "incoming").rglob("*.landrop.part"))
+    assert result.remote_root == "/incoming/project"
+    assert (remote / "incoming" / "project" / "notes.txt").read_bytes() == b"hello"
+    assert (remote / "incoming" / "project" / "images" / "a.png").read_bytes() == b"x" * 10
+    assert (remote / "incoming" / "project" / "empty").is_dir()
+    assert not list((remote / "incoming").rglob("*.irecon.part"))
 
 
 def test_real_upload_resumes_from_partial(tmp_path, server) -> None:
@@ -90,7 +93,7 @@ def test_real_upload_resumes_from_partial(tmp_path, server) -> None:
     partial_dir = remote / "incoming"
     partial_dir.mkdir()
     already = 512_000
-    (partial_dir / "resume.bin.landrop.part").write_bytes(payload[:already])
+    (partial_dir / "resume.bin.irecon.part").write_bytes(payload[:already])
 
     progress: list[tuple[int, int]] = []
     result = upload_file(
@@ -159,6 +162,41 @@ def test_real_upload_wrong_password_does_not_publish(tmp_path, server) -> None:
         )
 
     assert not (remote / "incoming" / "payload.bin").exists()
+
+
+def test_real_upload_publishes_empty_file(tmp_path, server) -> None:
+    sftp, remote = server
+    known_hosts = sftp.write_known_hosts(tmp_path / "known_hosts")
+    source = tmp_path / "empty.bin"
+    source.write_bytes(b"")
+
+    result = upload_file(**connect_kwargs(sftp, source, "/incoming", known_hosts))
+
+    final = remote / "incoming" / "empty.bin"
+    assert final.is_file()
+    assert final.read_bytes() == b""
+    assert result.sha256 == hashlib.sha256(b"").hexdigest()
+
+
+def test_real_directory_retry_skips_identical_files(tmp_path, server) -> None:
+    sftp, remote = server
+    known_hosts = sftp.write_known_hosts(tmp_path / "known_hosts")
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "notes.txt").write_bytes(b"hello")
+    (source / "empty.bin").write_bytes(b"")
+
+    first = upload_tree(
+        **connect_kwargs(sftp, source, "/incoming", known_hosts, remote_name="project")
+    )
+    second = upload_tree(
+        **connect_kwargs(sftp, source, "/incoming", known_hosts, remote_name="project")
+    )
+
+    assert first.ok_count == 2 and first.failed_count == 0
+    assert second.ok_count == 2 and second.failed_count == 0
+    assert all(item.skipped for item in second.files)
+    assert (remote / "incoming" / "project" / "empty.bin").read_bytes() == b""
 
 
 def test_probe_and_trust_round_trip(tmp_path, server, monkeypatch) -> None:

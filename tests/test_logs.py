@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from landrop import logs
+from irecon import logs
 
 
 @pytest.fixture(autouse=True)
@@ -51,9 +51,9 @@ def test_validate_rejects_an_unusable_path(tmp_path) -> None:
 
 
 def test_handler_rotates_when_the_file_grows(tmp_path) -> None:
-    handler = logs.DailyRotatingFileHandler(tmp_path / "landrop.log", max_bytes=200)
+    handler = logs.DailyRotatingFileHandler(tmp_path / "irecon.log", max_bytes=200)
     handler.setFormatter(logging.Formatter("%(message)s"))
-    record_logger = logging.getLogger("landrop.rotate-test")
+    record_logger = logging.getLogger("irecon.rotate-test")
     record_logger.addHandler(handler)
     record_logger.setLevel(logging.INFO)
     try:
@@ -63,9 +63,9 @@ def test_handler_rotates_when_the_file_grows(tmp_path) -> None:
         record_logger.removeHandler(handler)
         handler.close()
 
-    rotated = list(tmp_path.glob("landrop.log.*"))
+    rotated = list(tmp_path.glob("irecon.log.*"))
     assert rotated
-    assert (tmp_path / "landrop.log").stat().st_size <= 400
+    assert (tmp_path / "irecon.log").stat().st_size <= 400
 
 
 def test_handler_rotates_on_a_new_day(tmp_path, monkeypatch) -> None:
@@ -77,24 +77,24 @@ def test_handler_rotates_on_a_new_day(tmp_path, monkeypatch) -> None:
             return cls(cls.fixed.year, cls.fixed.month, cls.fixed.day)
 
     monkeypatch.setattr(logs, "date", FakeDate)
-    handler = logs.DailyRotatingFileHandler(tmp_path / "landrop.log")
+    handler = logs.DailyRotatingFileHandler(tmp_path / "irecon.log")
     handler.setFormatter(logging.Formatter("%(message)s"))
-    record = logging.LogRecord("landrop", logging.INFO, __file__, 1, "first", None, None)
+    record = logging.LogRecord("irecon", logging.INFO, __file__, 1, "first", None, None)
     handler.emit(record)
 
     FakeDate.fixed = date(2026, 1, 2)
-    second = logging.LogRecord("landrop", logging.INFO, __file__, 2, "second", None, None)
+    second = logging.LogRecord("irecon", logging.INFO, __file__, 2, "second", None, None)
     handler.emit(second)
     handler.close()
 
-    assert (tmp_path / "landrop.log.2026-01-01").read_text(encoding="utf-8").strip() == "first"
-    assert (tmp_path / "landrop.log").read_text(encoding="utf-8").strip() == "second"
+    assert (tmp_path / "irecon.log.2026-01-01").read_text(encoding="utf-8").strip() == "first"
+    assert (tmp_path / "irecon.log").read_text(encoding="utf-8").strip() == "second"
 
 
 def test_purge_removes_only_expired_rotated_files(tmp_path) -> None:
-    old = tmp_path / "landrop.log.2020-01-01"
-    recent = tmp_path / "landrop.log.2026-11-01"
-    current = tmp_path / "landrop.log"
+    old = tmp_path / "irecon.log.2020-01-01"
+    recent = tmp_path / "irecon.log.2026-11-01"
+    current = tmp_path / "irecon.log"
     unrelated = tmp_path / "service.log"
     for path in (old, recent, current, unrelated):
         path.write_text("x", encoding="utf-8")
@@ -110,7 +110,7 @@ def test_purge_removes_only_expired_rotated_files(tmp_path) -> None:
 
 
 def test_purge_is_disabled_when_retention_is_zero(tmp_path) -> None:
-    old = tmp_path / "landrop.log.2020-01-01"
+    old = tmp_path / "irecon.log.2020-01-01"
     old.write_text("x", encoding="utf-8")
     expired = time.time() - timedelta(days=365).total_seconds()
     os.utime(old, (expired, expired))
@@ -134,14 +134,14 @@ def test_legacy_log_is_migrated_once(tmp_path, monkeypatch) -> None:
 
 
 def test_describe_reports_files_and_total_size(tmp_path) -> None:
-    (tmp_path / "landrop.log").write_text("abcd", encoding="utf-8")
-    (tmp_path / "landrop.log.2026-11-01").write_text("ef", encoding="utf-8")
+    (tmp_path / "irecon.log").write_text("abcd", encoding="utf-8")
+    (tmp_path / "irecon.log.2026-11-01").write_text("ef", encoding="utf-8")
     (tmp_path / "notes.txt").write_text("ignored", encoding="utf-8")
 
     info = logs.describe(tmp_path)
 
     names = [entry["name"] for entry in info["files"]]
-    assert names == ["landrop.log", "landrop.log.2026-11-01", "notes.txt"]
+    assert names == ["irecon.log", "irecon.log.2026-11-01", "notes.txt"]
     assert info["total_size"] == 4 + 2 + 7
     assert info["dir"] == str(tmp_path)
 
@@ -157,7 +157,7 @@ def test_configure_logging_writes_records(tmp_path) -> None:
     directory = logs.configure_logging(str(tmp_path))
 
     assert directory == tmp_path
-    logging.getLogger("landrop.test").info("传输完成 3 个文件")
+    logging.getLogger("irecon.test").info("传输完成 3 个文件")
 
-    content = (tmp_path / "landrop.log").read_text(encoding="utf-8")
+    content = (tmp_path / "irecon.log").read_text(encoding="utf-8")
     assert "传输完成 3 个文件" in content

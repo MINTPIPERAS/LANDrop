@@ -35,8 +35,8 @@ def known_hosts_path() -> Path:
     """Return the app-owned known_hosts file (never the user's ~/.ssh file)."""
     if os.name == "nt":
         root = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        return root / "LANDrop" / "known_hosts"
-    return Path.home() / ".config" / "landrop" / "known_hosts"
+        return root / "iRecon" / "known_hosts"
+    return Path.home() / ".config" / "irecon" / "known_hosts"
 
 
 def _host_entry(host: str, port: int) -> str:
@@ -91,7 +91,7 @@ def _fetch_key(host: str, port: int, timeout: float) -> paramiko.PKey:
         client.connect(
             hostname=host,
             port=port,
-            username="landrop-probe",
+            username="irecon-probe",
             timeout=timeout,
             banner_timeout=timeout,
             auth_timeout=timeout,

@@ -3,7 +3,7 @@
 Three paths can execute a schedule, and they must never overlap:
 
 - the in-app loop (the service is running, progress visible in the UI);
-- ``landrop-service.exe --run-schedule <id>`` started by Task Scheduler;
+- ``irecon-service.exe --run-schedule <id>`` started by Task Scheduler;
 - the explicit "run now" button.
 
 The first two contend on ``run.lock``: the running service holds it for its whole
@@ -23,8 +23,8 @@ from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
 from typing import Callable, Sequence
 
-from landrop import credentials, hostkeys
-from landrop.config import (
+from irecon import credentials, hostkeys
+from irecon.config import (
     WEEKDAY_NAMES,
     AppConfig,
     ScheduleConfig,
@@ -33,13 +33,13 @@ from landrop.config import (
     parse_schedule_time,
     save_config,
 )
-from landrop.transfer import TransferCancelled, TransferError, upload_file, upload_tree
+from irecon.transfer import TransferCancelled, TransferError, upload_file, upload_tree
 
 logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 30
 DUE_GRACE = timedelta(minutes=5)
-TASK_PREFIX = "LANDrop-"
+TASK_PREFIX = "iRecon-"
 RUN_LOCK_NAME = "run.lock"
 TERMINAL_STATUSES = ("succeeded", "partial", "failed", "cancelled")
 
@@ -262,7 +262,7 @@ def system_tasks_supported() -> bool:
     if os.name != "nt":
         return False
     return bool(getattr(sys, "frozen", False)) or os.environ.get(
-        "LANDROP_ENABLE_SCHTASKS"
+        "IRECON_ENABLE_SCHTASKS"
     ) == "1"
 
 
@@ -375,7 +375,7 @@ def _resolve(schedule: ScheduleConfig, config: AppConfig):
 
 def dispatch_schedule(manager, config: AppConfig, schedule: ScheduleConfig):
     """Queue a schedule through the normal transfer manager (progress in the UI)."""
-    from landrop.api.app import TransferRequest  # local import avoids a cycle
+    from irecon.api.app import TransferRequest  # local import avoids a cycle
 
     device, password = _resolve(schedule, config)
     target = schedule.remote_dir.strip() or device.remote_dir.strip()
@@ -386,6 +386,7 @@ def dispatch_schedule(manager, config: AppConfig, schedule: ScheduleConfig):
         port=device.port,
         username=device.username,
         remote_dir=target,
+        remote_name=schedule.remote_name or None,
         local_path=schedule.source_path,
         auth_method=device.auth_method,
         password=password,
@@ -452,6 +453,7 @@ def run_once(schedule_id: str) -> int:
                 username=device.username,
                 local_path=schedule.source_path,
                 remote_dir=schedule.remote_dir.strip() or device.remote_dir,
+                remote_name=schedule.remote_name or None,
                 auth_method=device.auth_method,
                 password=password,
                 private_key_path=device.private_key_path or None,
@@ -493,7 +495,7 @@ class ScheduleLoop(threading.Thread):
     """Fires due schedules while the service is running."""
 
     def __init__(self, manager, interval: float = TICK_SECONDS) -> None:
-        super().__init__(name="landrop-scheduler", daemon=True)
+        super().__init__(name="irecon-scheduler", daemon=True)
         self._manager = manager
         self._interval = interval
         self._stop = threading.Event()

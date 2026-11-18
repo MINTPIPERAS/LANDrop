@@ -3,9 +3,9 @@
 Only the Windows backend is implemented for the first release. Other platforms
 raise :class:`CredentialError` instead of silently writing plaintext somewhere.
 
-Entries are keyed by ``LANDrop/<host>:<port>/<username>`` so two machines that
+Entries are keyed by ``iRecon/<host>:<port>/<username>`` so two machines that
 share a user name never overwrite each other's password. v0.1 wrote
-``LANDrop/<username>``; reads fall back to that legacy key once and re-save the
+``iRecon/<username>``; reads fall back to that legacy key once and re-save the
 value under the host-scoped key.
 """
 
@@ -16,7 +16,7 @@ import logging
 import os
 from ctypes import wintypes
 
-SERVICE_PREFIX = "LANDrop"
+SERVICE_PREFIX = "iRecon"
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
@@ -104,7 +104,7 @@ def _write(target_name: str, username: str, password: str) -> None:
         Flags=0,
         Type=CRED_TYPE_GENERIC,
         TargetName=target_name,
-        Comment="LANDrop SSH password",
+        Comment="iRecon SSH password",
         CredentialBlobSize=len(blob),
         CredentialBlob=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)),
         Persist=CRED_PERSIST_LOCAL_MACHINE,
