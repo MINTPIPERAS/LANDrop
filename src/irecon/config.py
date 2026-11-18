@@ -1,4 +1,4 @@
-"""Configuration loading and validation for LANDrop."""
+"""Configuration loading and validation for iRecon."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Literal, Sequence
+
+from irecon.transfer.naming import resolve_remote_name
 
 AuthMethod = Literal["password", "key"]
 
@@ -79,6 +81,7 @@ class ScheduleConfig:
     recursive: bool = False
     device_id: str = ""
     remote_dir: str = ""
+    remote_name: str = ""
     overwrite: bool = False
     mode: str = "once"
     time: str = "09:00"
@@ -109,6 +112,10 @@ class ScheduleConfig:
                 raise ValueError("星期取值必须在 0 到 6 之间")
         if not self.source_path.strip():
             raise ValueError("定时任务的来源路径不能为空")
+        if self.recursive:
+            # Validate the template with the default date so ``{date}`` names
+            # are checked without baking in today's date.
+            resolve_remote_name(self.remote_name, self.source_path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,8 +285,8 @@ def app_data_dir() -> Path:
     """Per-user application data directory, independent of the working directory."""
     if os.name == "nt":
         root = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        return root / "LANDrop"
-    return Path.home() / ".config" / "landrop"
+        return root / "iRecon"
+    return Path.home() / ".config" / "irecon"
 
 
 def config_path() -> Path:

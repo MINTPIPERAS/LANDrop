@@ -6,12 +6,13 @@ import os
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from landrop import scheduler
-from landrop.config import AppConfig, DeviceConfig, ScheduleConfig
-from landrop.transfer import TransferError, TransferResult
+from irecon import scheduler
+from irecon.config import AppConfig, DeviceConfig, ScheduleConfig
+from irecon.transfer import TransferError, TransferResult
 
 
 def schedule(**overrides) -> ScheduleConfig:
@@ -90,7 +91,7 @@ def test_missed_one_shot_stays_due_but_is_flagged() -> None:
 
 
 def test_task_names_are_ascii_and_stable() -> None:
-    assert scheduler.task_name("abcdef123456") == "LANDrop-abcdef12"
+    assert scheduler.task_name("abcdef123456") == "iRecon-abcdef12"
 
 
 def test_create_args_map_each_mode() -> None:
@@ -114,33 +115,33 @@ def test_create_args_map_each_mode() -> None:
 
 
 def test_sync_registers_enabled_and_removes_stale_tasks(monkeypatch) -> None:
-    monkeypatch.setenv("LANDROP_ENABLE_SCHTASKS", "1")
+    monkeypatch.setenv("IRECON_ENABLE_SCHTASKS", "1")
     calls: list[list[str]] = []
 
     def runner(args: list[str]) -> tuple[int, str]:
         calls.append(args)
         if len(args) > 1 and args[1] == "/Query":
-            return 0, '"LANDrop-old12345","N/A",""\n"MicrosoftEdgeUpdate","N/A",""\n'
+            return 0, '"iRecon-old12345","N/A",""\n"MicrosoftEdgeUpdate","N/A",""\n'
         return 0, "SUCCESS"
 
     statuses = scheduler.sync_tasks([schedule(enabled=True)], runner=runner)
 
     assert statuses == [
-        {"id": "s1", "task": "LANDrop-s1", "ok": True, "error": None}
+        {"id": "s1", "task": "iRecon-s1", "ok": True, "error": None}
     ]
     creates = [call for call in calls if call[1] == "/Create"]
     assert len(creates) == 1
     deletes = [call for call in calls if call[1] == "/Delete"]
-    assert deletes and deletes[0][3] == "LANDrop-old12345"
+    assert deletes and deletes[0][3] == "iRecon-old12345"
 
 
 def test_sync_skips_disabled_rules(monkeypatch) -> None:
-    monkeypatch.setenv("LANDROP_ENABLE_SCHTASKS", "1")
+    monkeypatch.setenv("IRECON_ENABLE_SCHTASKS", "1")
     calls: list[list[str]] = []
 
     def runner(args: list[str]) -> tuple[int, str]:
         calls.append(args)
-        return 0, '"LANDrop-s1","N/A",""\n'
+        return 0, '"iRecon-s1","N/A",""\n'
 
     statuses = scheduler.sync_tasks([schedule(enabled=False)], runner=runner)
 
@@ -150,7 +151,7 @@ def test_sync_skips_disabled_rules(monkeypatch) -> None:
 
 
 def test_sync_is_a_no_op_in_development(monkeypatch) -> None:
-    monkeypatch.delenv("LANDROP_ENABLE_SCHTASKS", raising=False)
+    monkeypatch.delenv("IRECON_ENABLE_SCHTASKS", raising=False)
 
     statuses = scheduler.sync_tasks([schedule()])
 
@@ -283,3 +284,82 @@ def test_record_run_keeps_daily_rules_enabled() -> None:
     assert updated.schedules[0].enabled is True
     assert updated.schedules[0].last_run_status == "succeeded"
     assert updated.schedules[0].last_run_at == "2026-11-06T09:00:00"
+
+
+def test_dispatch_schedule_passes_the_remote_name_template(monkeypatch) -> None:
+    item = schedule(
+        mode="daily",
+        recursive=True,
+        source_path="C:/src/project",
+        remote_name="{date}_project",
+    )
+    config = config_with(item)
+    captured: dict[str, object] = {}
+
+    class FakeTask:
+        task_id = "task-1"
+
+    class FakeManager:
+        def start(self, request, *, source="manual"):
+            captured["request"] = request
+            captured["source"] = source
+            return FakeTask()
+
+    class NoopThread:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(scheduler, "save_run_result", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler.threading, "Thread", NoopThread)
+
+    scheduler.dispatch_schedule(FakeManager(), config, item)
+
+    request = captured["request"]
+    assert getattr(request, "remote_name") == "{date}_project"
+    assert getattr(request, "recursive") is True
+    assert captured["source"] == "schedule"
+
+
+def test_run_once_passes_the_remote_name_to_upload_tree(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "a.txt").write_bytes(b"x")
+    item = schedule(
+        mode="daily",
+        recursive=True,
+        source_path=str(source),
+        remote_name="{date}_project",
+    )
+    config = config_with(item)
+    captured: dict[str, object] = {}
+
+    def fake_upload_tree(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(failed_count=0, ok_count=1)
+
+    monkeypatch.setattr(scheduler, "load_config", lambda: config)
+    monkeypatch.setattr(scheduler, "upload_tree", fake_upload_tree)
+    monkeypatch.setattr(scheduler, "save_run_result", lambda *args, **kwargs: None)
+
+    assert scheduler.run_once("s1") == 0
+    assert captured["remote_name"] == "{date}_project"
+
+
+def test_schedule_validates_the_remote_name_template(tmp_path) -> None:
+    source = tmp_path / "project"
+    source.mkdir()
+    schedule(
+        recursive=True,
+        source_path=str(source),
+        remote_name="{date}_project",
+    ).validate()
+
+    with pytest.raises(ValueError, match="文件夹名"):
+        schedule(
+            recursive=True,
+            source_path=str(source),
+            remote_name="../escape",
+        ).validate()

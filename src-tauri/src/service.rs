@@ -60,8 +60,8 @@ impl ServiceState {
         let token = session_token()?;
         let mut command = service_command()?;
         command
-            .env("LANDROP_SERVICE_PORT", port.to_string())
-            .env("LANDROP_SERVICE_TOKEN", &token)
+            .env("IRECON_SERVICE_PORT", port.to_string())
+            .env("IRECON_SERVICE_TOKEN", &token)
             .env("PYTHONUTF8", "1")
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
@@ -142,7 +142,7 @@ fn service_command() -> Result<Command, String> {
 
     if cfg!(debug_assertions) {
         let mut command = Command::new(dev_python());
-        command.args(["-m", "landrop.api.app"]);
+        command.args(["-m", "irecon.api.app"]);
         if let Some(root) = repo_root() {
             command.current_dir(root);
         }
@@ -150,29 +150,29 @@ fn service_command() -> Result<Command, String> {
     }
 
     Err(format!(
-        "找不到本机传输服务程序，请重新安装 LANDrop（已查找 {}）",
-        exe_dir.join("landrop-service").join("landrop-service.exe").display()
+        "找不到本机传输服务程序，请重新安装 iRecon（已查找 {}）",
+        exe_dir.join("irecon-service").join("irecon-service.exe").display()
     ))
 }
 
 /// Locate the packaged sidecar in every layout the bundlers produce.
 fn packaged_service(exe_dir: &Path) -> Option<PathBuf> {
     let candidates = [
-        // Tauri resource: <install>/landrop-service/landrop-service.exe
-        exe_dir.join("landrop-service").join("landrop-service.exe"),
+        // Tauri resource: <install>/irecon-service/irecon-service.exe
+        exe_dir.join("irecon-service").join("irecon-service.exe"),
         // MSI nests resources in a ``resources`` folder.
         exe_dir
             .join("resources")
-            .join("landrop-service")
-            .join("landrop-service.exe"),
+            .join("irecon-service")
+            .join("irecon-service.exe"),
         // Portable layout: beside the app executable.
-        exe_dir.join("landrop-service.exe"),
+        exe_dir.join("irecon-service.exe"),
     ];
     candidates.into_iter().find(|path| path.is_file())
 }
 
 fn dev_python() -> String {
-    std::env::var("LANDROP_PYTHON").unwrap_or_else(|_| "python".to_string())
+    std::env::var("IRECON_PYTHON").unwrap_or_else(|_| "python".to_string())
 }
 
 fn repo_root() -> Option<PathBuf> {
@@ -209,7 +209,7 @@ fn health_ok(port: u16, token: &str) -> bool {
     };
     let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
     let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-LANDrop-Token: {token}\r\nConnection: close\r\n\r\n"
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-iRecon-Token: {token}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;

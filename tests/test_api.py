@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 from pathlib import Path
@@ -7,10 +8,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import landrop.api.app as api
-from landrop.api.app import ServiceConfig, TransferManager, create_app
-from landrop.config import DeviceConfig, ScheduleConfig
-from landrop.transfer import (
+import irecon.api.app as api
+from irecon.api.app import ServiceConfig, TransferManager, create_app
+from irecon.config import DeviceConfig, ScheduleConfig
+from irecon.transfer import (
     TransferCancelled,
     TransferError,
     TransferResult,
@@ -19,7 +20,7 @@ from landrop.transfer import (
 )
 
 TOKEN = "a" * 48
-HEADERS = {"X-LANDrop-Token": TOKEN}
+HEADERS = {"X-iRecon-Token": TOKEN}
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +62,7 @@ def base_payload(local_path, **overrides) -> dict:
 def test_health_requires_session_token() -> None:
     with make_client() as client:
         assert client.get("/health").status_code == 401
-        assert client.get("/health", headers={"X-LANDrop-Token": "wrong"}).status_code == 401
+        assert client.get("/health", headers={"X-iRecon-Token": "wrong"}).status_code == 401
         response = client.get("/health", headers=HEADERS)
         assert response.status_code == 200
         assert response.json() == {"status": "ready"}
@@ -86,19 +87,19 @@ def test_untrusted_origin_is_rejected() -> None:
 
 
 def test_service_config_rejects_missing_environment(monkeypatch) -> None:
-    monkeypatch.delenv("LANDROP_SERVICE_PORT", raising=False)
-    monkeypatch.delenv("LANDROP_SERVICE_TOKEN", raising=False)
+    monkeypatch.delenv("IRECON_SERVICE_PORT", raising=False)
+    monkeypatch.delenv("IRECON_SERVICE_TOKEN", raising=False)
 
     with pytest.raises(RuntimeError, match="启动参数缺失"):
         ServiceConfig.from_environment()
 
 
 def test_service_config_validates_token_and_port(monkeypatch) -> None:
-    monkeypatch.setenv("LANDROP_SERVICE_PORT", "45678")
-    monkeypatch.setenv("LANDROP_SERVICE_TOKEN", "c" * 48)
+    monkeypatch.setenv("IRECON_SERVICE_PORT", "45678")
+    monkeypatch.setenv("IRECON_SERVICE_TOKEN", "c" * 48)
     assert ServiceConfig.from_environment() == ServiceConfig(45678, "c" * 48)
 
-    monkeypatch.setenv("LANDROP_SERVICE_PORT", "70000")
+    monkeypatch.setenv("IRECON_SERVICE_PORT", "70000")
     with pytest.raises(RuntimeError, match="端口超出范围"):
         ServiceConfig.from_environment()
 
@@ -250,6 +251,36 @@ def test_failed_task_can_be_retried_with_new_task(tmp_path, monkeypatch) -> None
             assert second["id"] != first["id"]
             snapshot = wait_for_status(client, second["id"], {"succeeded"})
             assert snapshot["result"]["sha256"] == "d" * 64
+    finally:
+        manager.close()
+
+
+def test_retry_can_force_overwrite(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "retry-overwrite.bin"
+    source.write_bytes(b"retry")
+    overwrite_values: list[bool] = []
+
+    def failing_upload(**kwargs):
+        overwrite_values.append(kwargs["overwrite"])
+        raise TransferError("远端目标文件已存在", code="target_exists")
+
+    monkeypatch.setattr(api, "upload_file", failing_upload)
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            first = client.post(
+                "/api/transfers", json=base_payload(source), headers=HEADERS
+            ).json()
+            wait_for_status(client, first["id"], {"failed"})
+
+            response = client.post(
+                f"/api/transfers/{first['id']}/retry",
+                headers=HEADERS,
+                json={"password": "not-returned", "overwrite": True},
+            )
+            assert response.status_code == 202
+            wait_for_status(client, response.json()["id"], {"failed"})
+            assert overwrite_values == [False, True]
     finally:
         manager.close()
 
@@ -432,17 +463,19 @@ def test_directory_transfer_reports_partial_results(tmp_path, monkeypatch) -> No
     folder = tmp_path / "batch"
     folder.mkdir()
     (folder / "a.txt").write_bytes(b"aaaa")
+    seen: dict = {}
 
     def fake_upload_tree(**kwargs):
+        seen.update(kwargs)
         kwargs["file_progress"]("a.txt", 1, 2)
         kwargs["progress"](10, 10)
         return TreeResult(
             local_root=folder,
-            remote_root="/incoming",
+            remote_root="/incoming/batch",
             files=(
-                TreeFileResult("a.txt", "/incoming/a.txt", 4, True),
+                TreeFileResult("a.txt", "/incoming/batch/a.txt", 4, True),
                 TreeFileResult(
-                    "b.txt", "/incoming/b.txt", 6, False, "远端目标文件已存在", "target_exists"
+                    "b.txt", "/incoming/batch/b.txt", 6, False, "远端目标文件已存在", "target_exists"
                 ),
             ),
             ok_count=1,
@@ -456,7 +489,9 @@ def test_directory_transfer_reports_partial_results(tmp_path, monkeypatch) -> No
     try:
         with make_client(manager) as client:
             response = client.post(
-                "/api/transfers", json=base_payload(folder, recursive=True), headers=HEADERS
+                "/api/transfers",
+                json=base_payload(folder, recursive=True, remote_name="batch"),
+                headers=HEADERS,
             )
             assert response.status_code == 202
 
@@ -466,6 +501,8 @@ def test_directory_transfer_reports_partial_results(tmp_path, monkeypatch) -> No
 
             assert snapshot["status"] == "partial"
             assert snapshot["request"]["recursive"] is True
+            assert snapshot["request"]["remote_name"] == "batch"
+            assert seen["remote_name"] == "batch"
             assert snapshot["result"]["ok_count"] == 1
             assert snapshot["result"]["failed_count"] == 1
             assert snapshot["result"]["files"][1]["error_code"] == "target_exists"
@@ -483,8 +520,8 @@ def test_directory_transfer_succeeds_when_every_file_lands(tmp_path, monkeypatch
         kwargs["progress"](1, 1)
         return TreeResult(
             local_root=folder,
-            remote_root="/incoming",
-            files=(TreeFileResult("a.txt", "/incoming/a.txt", 1, True),),
+            remote_root="/incoming/all-good",
+            files=(TreeFileResult("a.txt", "/incoming/all-good/a.txt", 1, True),),
             ok_count=1,
             failed_count=0,
             skipped=(),
@@ -496,7 +533,9 @@ def test_directory_transfer_succeeds_when_every_file_lands(tmp_path, monkeypatch
     try:
         with make_client(manager) as client:
             response = client.post(
-                "/api/transfers", json=base_payload(folder, recursive=True), headers=HEADERS
+                "/api/transfers",
+                json=base_payload(folder, recursive=True, remote_name="all-good"),
+                headers=HEADERS,
             )
             snapshot = wait_for_status(
                 client, response.json()["id"], {"partial", "succeeded", "failed"}
@@ -505,7 +544,56 @@ def test_directory_transfer_succeeds_when_every_file_lands(tmp_path, monkeypatch
             assert snapshot["status"] == "succeeded"
             assert snapshot["files_done"] == 1
             assert snapshot["files_total"] == 1
+            assert snapshot["request"]["remote_name"] == "all-good"
             assert snapshot["result"]["failed_count"] == 0
+    finally:
+        manager.close()
+
+
+def test_directory_transfer_rejects_invalid_remote_name(tmp_path) -> None:
+    folder = tmp_path / "batch"
+    folder.mkdir()
+
+    with make_client() as client:
+        response = client.post(
+            "/api/transfers",
+            json=base_payload(folder, recursive=True, remote_name="../escape"),
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 400
+        assert "文件夹名" in response.json()["detail"]
+
+
+def test_directory_transfer_defaults_the_remote_name(tmp_path, monkeypatch) -> None:
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    seen: dict = {}
+
+    def fake_upload_tree(**kwargs):
+        seen.update(kwargs)
+        return TreeResult(
+            local_root=folder,
+            remote_root="/incoming/default",
+            files=(),
+            ok_count=0,
+            failed_count=0,
+            skipped=(),
+            size=0,
+        )
+
+    monkeypatch.setattr(api, "upload_tree", fake_upload_tree)
+    manager = TransferManager(max_workers=1)
+    try:
+        with make_client(manager) as client:
+            response = client.post(
+                "/api/transfers",
+                json=base_payload(folder, recursive=True),
+                headers=HEADERS,
+            )
+            wait_for_status(client, response.json()["id"], {"succeeded", "failed"})
+
+            assert re.fullmatch(r"\d{4}-\d{2}-\d{2}_batch", seen["remote_name"])
     finally:
         manager.close()
 
@@ -563,6 +651,39 @@ def test_scan_endpoint_summarizes_a_folder(tmp_path) -> None:
             "/api/scan", json={"path": str(tmp_path / "missing")}, headers=HEADERS
         )
         assert missing.status_code == 400
+
+
+def test_fs_list_endpoint_returns_entries(tmp_path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "sub").mkdir()
+    (root / "a.txt").write_bytes(b"hello")
+
+    with make_client() as client:
+        response = client.get("/api/fs/list", params={"path": str(root)}, headers=HEADERS)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["path"] == str(root)
+        assert body["total"] == 2
+        assert body["truncated"] is False
+        assert {item["name"] for item in body["entries"]} == {"a.txt", "sub"}
+
+        missing = client.get(
+            "/api/fs/list", params={"path": str(tmp_path / "missing")}, headers=HEADERS
+        )
+        assert missing.status_code == 400
+
+        assert client.get("/api/fs/list", params={"path": str(root)}).status_code == 401
+
+
+def test_fs_roots_endpoint_returns_home() -> None:
+    with make_client() as client:
+        response = client.get("/api/fs/roots", headers=HEADERS)
+
+        assert response.status_code == 200
+        roots = response.json()["roots"]
+        assert any(item["path"] == str(Path.home()) for item in roots)
+        assert all(item["kind"] for item in roots)
 
 
 def test_config_api_normalizes_hotkey(monkeypatch) -> None:
@@ -634,7 +755,7 @@ def test_config_api_rejects_hotkey_without_modifier(monkeypatch) -> None:
 def test_logs_endpoint_lists_files(tmp_path, monkeypatch) -> None:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    (log_dir / "landrop.log").write_text("abcd", encoding="utf-8")
+    (log_dir / "irecon.log").write_text("abcd", encoding="utf-8")
     monkeypatch.setattr(api, "load_config", lambda: api.AppConfig(log_dir=str(log_dir)))
 
     with make_client() as client:
@@ -644,7 +765,7 @@ def test_logs_endpoint_lists_files(tmp_path, monkeypatch) -> None:
         body = response.json()
         assert body["dir"] == str(log_dir)
         assert body["total_size"] == 4
-        assert body["files"][0]["name"] == "landrop.log"
+        assert body["files"][0]["name"] == "irecon.log"
 
 
 def test_logs_open_endpoint_uses_the_configured_directory(tmp_path, monkeypatch) -> None:
@@ -966,6 +1087,42 @@ def test_saving_config_preserves_scheduler_run_state(tmp_path, monkeypatch) -> N
     config = saved["config"]
     assert isinstance(config, api.AppConfig)
     assert config.schedules[0].last_run_at == "2026-11-09T09:00:05"
+
+
+def test_saving_config_persists_schedule_remote_name(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "project"
+    source.mkdir()
+    monkeypatch.setattr(api, "load_config", lambda: api.AppConfig())
+    saved: dict[str, object] = {}
+    monkeypatch.setattr(
+        api, "save_config", lambda config: saved.__setitem__("config", config)
+    )
+    monkeypatch.setattr(api.scheduler, "sync_tasks", lambda schedules: [])
+
+    with make_client() as client:
+        payload = {
+            "devices": [
+                {
+                    "id": "d1", "host": "h", "username": "u", "auth_method": "key",
+                    "remote_dir": "/in", "private_key_path": "",
+                }
+            ],
+            "schedules": [
+                {
+                    "id": "s1", "source_path": str(source), "device_id": "d1",
+                    "recursive": True, "remote_name": "{date}_project",
+                    "mode": "daily", "time": "09:00", "enabled": True,
+                }
+            ],
+        }
+        response = client.put("/api/config", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        assert response.json()["schedules"][0]["remote_name"] == "{date}_project"
+
+    config = saved["config"]
+    assert isinstance(config, api.AppConfig)
+    assert config.schedules[0].remote_name == "{date}_project"
 
 
 def test_finished_one_shot_stays_disabled(tmp_path, monkeypatch) -> None:

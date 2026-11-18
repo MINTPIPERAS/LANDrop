@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE_NAME: &str = "LANDrop";
+const VALUE_NAME: &str = "iRecon";
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -115,7 +115,7 @@ mod tests {
     /// Opt-in: touches the real HKCU Run key, then restores whatever was there.
     #[test]
     fn toggle_round_trip_restores_previous_state() {
-        if std::env::var("LANDROP_TEST_AUTOSTART").is_err() {
+        if std::env::var("IRECON_TEST_AUTOSTART").is_err() {
             return;
         }
         let previous = registered_command();

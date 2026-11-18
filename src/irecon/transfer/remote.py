@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import posixpath
 import socket
 from pathlib import Path
@@ -9,11 +10,42 @@ from typing import Callable
 
 import paramiko
 
-from landrop.transfer.errors import TransferError
+from irecon.transfer.errors import TransferError
 
 # A stalled SFTP channel would otherwise block reads/writes forever, making the
 # task impossible to cancel; 1 MiB per 120 s is far below any usable link speed.
 IO_TIMEOUT = 120.0
+
+# Socket/session failures are retryable as connection errors. Everything else
+# from an SFTP file operation (ENOENT, EACCES, ENOSPC, ...) is a file-level
+# failure that must not abort a whole directory transfer. Windows socket errors
+# are included explicitly because errno uses WSA codes there.
+_CONNECTION_ERRNOS = {
+    getattr(errno, name)
+    for name in (
+        "ECONNRESET",
+        "ECONNABORTED",
+        "ECONNREFUSED",
+        "EPIPE",
+        "ETIMEDOUT",
+        "EHOSTUNREACH",
+        "ENETUNREACH",
+        "ENETDOWN",
+        "ENOTCONN",
+        "ESHUTDOWN",
+    )
+    if hasattr(errno, name)
+}
+_CONNECTION_ERRNOS.update({10053, 10054, 10060, 10061})
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """Return True for socket/session failures, not SFTP file errors."""
+    if isinstance(
+        exc, (socket.gaierror, ConnectionError, TimeoutError, paramiko.SSHException)
+    ):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _CONNECTION_ERRNOS
 
 
 def validate_connection(
@@ -41,13 +73,17 @@ def validate_connection(
 def classify_connection_error(exc: BaseException) -> TransferError:
     """Map paramiko/socket failures onto the stable UI error codes."""
     if isinstance(exc, paramiko.PasswordRequiredException):
-        return TransferError("私钥带有口令，LANDrop 不支持，请使用无口令私钥", code="auth_failed")
+        return TransferError("私钥带有口令，iRecon 不支持，请使用无口令私钥", code="auth_failed")
     if isinstance(exc, paramiko.AuthenticationException):
         return TransferError("认证失败：请检查用户名、密码或私钥", code="auth_failed")
     if isinstance(exc, paramiko.BadHostKeyException):
         return TransferError("远端主机密钥与已保存的不一致，请重新核对指纹", code="host_key_changed")
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return TransferError("连接远端超时，请检查防火墙与网段", code="timeout")
+    if isinstance(exc, EOFError):
+        return TransferError("连接远端中断，请检查网络后重试", code="network_error")
+    if isinstance(exc, OSError) and not is_connection_error(exc):
+        return TransferError(f"远端文件操作失败: {exc}", code="remote_io")
     return TransferError(f"SFTP 传输失败: {exc}", code="network_error")
 
 
@@ -109,7 +145,7 @@ def connect_sftp(
     except TransferError:
         client.close()
         raise
-    except (OSError, paramiko.SSHException) as exc:
+    except (OSError, paramiko.SSHException, EOFError) as exc:
         client.close()
         raise classify_connection_error(exc) from exc
     except BaseException:

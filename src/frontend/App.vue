@@ -3,6 +3,9 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { isRegistered, register, unregister } from '@tauri-apps/plugin-global-shortcut'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import FilePickerDialog from './components/FilePickerDialog.vue'
+import { uniqueRemoteNames, type PickerConfirmResult, type PickerMode } from './picker'
 import {
   AlertCircle,
   ArrowDownToLine,
@@ -13,15 +16,16 @@ import {
   File,
   FileText,
   Folder,
-  FolderOpen,
   KeyRound,
   Laptop,
   LockKeyhole,
+  Moon,
   Plus,
   RefreshCw,
   Settings2,
   ShieldAlert,
   ShieldCheck,
+  Sun,
   Trash2,
   Upload,
   Wifi,
@@ -50,6 +54,8 @@ import {
   DEFAULT_HOTKEY,
   deleteDevice,
   deleteSchedule,
+  defaultRemoteFolderName,
+  defaultScheduleFolderName,
   devices,
   errorHint,
   fileName,
@@ -97,6 +103,7 @@ import {
   tasks,
   toggleSchedule,
   updateSystemSettings,
+  validateRemoteName,
 } from './store/transfer'
 
 const hotkeyStatus = ref('快捷键未注册')
@@ -112,6 +119,20 @@ const showHelpPanel = ref(false)
 const connectionHint = ref<string | null>(null)
 const connectionHintError = ref(false)
 const connectionSection = ref<HTMLElement | null>(null)
+type FolderDialogMode = 'add' | 'rename'
+const folderDialog = ref<{ path: string; mode: FolderDialogMode; key: string | null } | null>(null)
+const folderDialogName = ref('')
+const folderDialogError = ref<string | null>(null)
+const folderDialogBusy = ref(false)
+const folderDialogInput = ref<HTMLInputElement | null>(null)
+type PickerTarget = 'queue' | 'schedule'
+const picker = ref<{
+  target: PickerTarget
+  mode: PickerMode
+  multiple: boolean
+  title: string
+} | null>(null)
+const folderBatch = ref({ running: false, done: 0, total: 0 })
 const WEEKDAY_LABELS = ['一', '二', '三', '四', '五', '六', '日']
 const draftModifiers = ref<string[]>([...DEFAULT_HOTKEY.modifiers])
 const draftKey = ref(DEFAULT_HOTKEY.key)
@@ -119,6 +140,35 @@ let registeredAccelerator: string | null = null
 let liveTimer: number | null = null
 
 const isDesktop = '__TAURI_INTERNALS__' in window
+
+type Theme = 'dark' | 'light'
+const THEME_STORAGE_KEY = 'irecon-theme'
+const currentTheme = ref<Theme>(
+  document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+)
+
+function applyTheme(theme: Theme) {
+  document.documentElement.dataset.theme = theme
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, theme)
+  } catch {
+    // Storage may be unavailable; the choice still applies to this session.
+  }
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute('content', theme === 'dark' ? '#0b0d10' : '#f4f6f8')
+  if (!isDesktop) return
+  void getCurrentWindow().setTheme(theme).catch(() => {
+    // Older shells may not allow changing the native titlebar theme.
+  })
+}
+
+function toggleTheme() {
+  const next: Theme = currentTheme.value === 'dark' ? 'light' : 'dark'
+  currentTheme.value = next
+  applyTheme(next)
+}
+
 const selectedTask = computed(() => activeTask.value ?? tasks.value[0] ?? null)
 const recentTasks = computed(() => tasks.value.slice(0, 8))
 const totalSent = computed(() =>
@@ -158,33 +208,173 @@ function tone(task: { status: string }): 'green' | 'blue' | 'amber' | 'red' {
   return 'blue'
 }
 
-async function chooseFile() {
+function openPicker(target: PickerTarget, mode: PickerMode, multiple: boolean, title: string) {
   if (isLocked.value) return
-  if (!isDesktop) {
-    addFiles(['示例文件_仅供预览.zip'])
-    return
-  }
-  const selected = await open({ multiple: true, directory: false })
-  const paths = typeof selected === 'string' ? [selected] : Array.isArray(selected) ? selected : []
-  addFiles(paths)
+  picker.value = { target, mode, multiple, title }
 }
 
-async function chooseFolder() {
+function closePicker() {
+  picker.value = null
+}
+
+function chooseFile() {
+  openPicker('queue', 'file', true, '添加文件或文件夹')
+}
+
+function chooseFolder() {
+  openPicker('queue', 'folder', true, '添加文件或文件夹')
+}
+
+function handlePickerConfirm(result: PickerConfirmResult) {
+  const target = picker.value?.target
+  closePicker()
+  if (!target) return
+  if (target === 'schedule') {
+    if (result.files.length) {
+      scheduleDraft.sourcePath = result.files[0]
+      scheduleDraft.recursive = false
+      scheduleDraft.remoteName = ''
+    } else if (result.folders.length) {
+      scheduleDraft.sourcePath = result.folders[0]
+      scheduleDraft.recursive = true
+      scheduleDraft.remoteName = defaultScheduleFolderName(result.folders[0])
+    }
+    return
+  }
+  if (result.files.length) addFiles(result.files)
+  if (result.folders.length === 1) {
+    openFolderDialog(result.folders[0], 'add')
+  } else if (result.folders.length > 1) {
+    void addFoldersFromPicker(result.folders)
+  }
+}
+
+async function addFoldersFromPicker(paths: string[]) {
+  const pending = paths.filter(
+    path => !queue.value.some(item => item.key === path.trim().toLowerCase()),
+  )
+  if (!pending.length) return
+  const existingNames = queue.value
+    .filter(item => item.kind === 'folder')
+    .map(item => item.remoteName?.trim() || defaultRemoteFolderName(item.path))
+  const names = uniqueRemoteNames(pending, existingNames)
+  if (!isDesktop) {
+    for (const path of pending) {
+      queue.value.push({
+        key: path.trim().toLowerCase(),
+        path,
+        kind: 'folder',
+        size: 0,
+        fileCount: 0,
+        remoteName: names.get(path) ?? defaultRemoteFolderName(path),
+      })
+    }
+    return
+  }
+  const errors: string[] = []
+  busy.value = true
+  try {
+    for (let index = 0; index < pending.length; index += 1) {
+      const path = pending[index]
+      folderBatch.value = { running: true, done: index, total: pending.length }
+      const name = names.get(path) ?? defaultRemoteFolderName(path)
+      const error = await addFolder(path, name)
+      if (error) errors.push(`${fileName(path)}：${error}`)
+    }
+  } finally {
+    folderBatch.value = { running: false, done: pending.length, total: pending.length }
+    busy.value = false
+  }
+  if (errors.length) lastError.value = errors.join('；')
+}
+
+function openFolderDialog(
+  path: string,
+  mode: FolderDialogMode,
+  key: string | null = null,
+  currentName = '',
+) {
   if (isLocked.value) return
+  folderDialog.value = { path, mode, key }
+  folderDialogName.value = currentName || defaultRemoteFolderName(path)
+  folderDialogError.value = null
+  folderDialogBusy.value = false
+  void nextTick(() => {
+    folderDialogInput.value?.focus()
+    folderDialogInput.value?.select()
+  })
+}
+
+function closeFolderDialog() {
+  if (folderDialogBusy.value) return
+  folderDialog.value = null
+  folderDialogError.value = null
+}
+
+async function confirmFolderDialog() {
+  const dialog = folderDialog.value
+  if (!dialog || folderDialogBusy.value) return
+  if (isLocked.value) {
+    folderDialogError.value = '正在发送，请等待这一批完成'
+    return
+  }
+  const name = folderDialogName.value.trim()
+  const nameError = validateRemoteName(name)
+  if (nameError) {
+    folderDialogError.value = nameError
+    return
+  }
+  const duplicate = queue.value.some(
+    item =>
+      item.kind === 'folder' &&
+      item.key !== dialog.key &&
+      (item.remoteName?.trim() || defaultRemoteFolderName(item.path)) === name,
+  )
+  if (duplicate) {
+    folderDialogError.value = '列表中已有同名远端文件夹，请换一个名称'
+    return
+  }
+  if (dialog.mode === 'rename') {
+    const item = queue.value.find(entry => entry.key === dialog.key)
+    if (item) item.remoteName = name
+    closeFolderDialog()
+    return
+  }
   if (!isDesktop) {
     queue.value.push({
-      key: 'preview-folder',
-      path: '示例文件夹_仅供预览',
+      key: `preview-folder-${queue.value.length}`,
+      path: dialog.path,
       kind: 'folder',
       size: 0,
       fileCount: 0,
+      remoteName: name,
     })
+    closeFolderDialog()
     return
   }
-  const selected = await open({ directory: true })
-  if (typeof selected !== 'string') return
-  const error = await addFolder(selected)
-  if (error) lastError.value = error
+  folderDialogBusy.value = true
+  const scanError = await addFolder(dialog.path, name)
+  folderDialogBusy.value = false
+  if (scanError) {
+    folderDialogError.value = scanError
+    return
+  }
+  closeFolderDialog()
+}
+
+function editFolderName(item: {
+  key: string
+  path: string
+  kind: 'file' | 'folder'
+  remoteName?: string
+}) {
+  if (item.kind !== 'folder' || batch.value.running) return
+  openFolderDialog(
+    item.path,
+    'rename',
+    item.key,
+    item.remoteName || defaultRemoteFolderName(item.path),
+  )
 }
 
 async function choosePrivateKey() {
@@ -264,22 +454,12 @@ function toggleSchedulePanel() {
   void refreshScheduleStatus()
 }
 
-async function chooseScheduleSource() {
-  if (!isDesktop) return
-  const selected = await open({ multiple: false, directory: false })
-  if (typeof selected === 'string') {
-    scheduleDraft.sourcePath = selected
-    scheduleDraft.recursive = false
-  }
+function chooseScheduleSource() {
+  openPicker('schedule', 'file', false, '选择定时任务来源')
 }
 
-async function chooseScheduleFolder() {
-  if (!isDesktop) return
-  const selected = await open({ directory: true })
-  if (typeof selected === 'string') {
-    scheduleDraft.sourcePath = selected
-    scheduleDraft.recursive = true
-  }
+function chooseScheduleFolder() {
+  openPicker('schedule', 'folder', false, '选择定时任务来源')
 }
 
 function toggleDraftWeekday(day: number) {
@@ -483,6 +663,7 @@ function openHotkeyEditor() {
 }
 
 onMounted(async () => {
+  applyTheme(currentTheme.value)
   await connectService()
   resetScheduleDraft()
   void refreshAutostart()
@@ -516,7 +697,7 @@ onUnmounted(() => {
     <aside class="sidebar">
       <div class="brand-row">
         <div class="brand-mark"><ArrowDownToLine :size="18" stroke-width="2.4" /></div>
-        <span class="brand-name">LANDrop</span>
+        <span class="brand-name">iRecon</span>
       </div>
 
       <div class="side-section-label">工作区</div>
@@ -584,7 +765,7 @@ onUnmounted(() => {
           <ShieldCheck :size="15" /><span>加密传输 · 只在你和对方电脑之间</span>
         </div>
         <button class="profile-row" title="点击开启/关闭全局快捷键" @click="toggleHotkey">
-          <div class="avatar">L</div>
+          <div class="avatar">i</div>
           <span class="profile-copy"><strong>全局快捷键</strong><small>{{ hotkeyStatus }}</small></span>
           <Settings2 :size="16" class="muted-icon" />
         </button>
@@ -605,13 +786,22 @@ onUnmounted(() => {
 
     <main class="main-area">
       <header class="topbar">
-        <div class="breadcrumbs"><span>LANDrop</span><span class="crumb-divider">/</span><strong>传输任务</strong></div>
+        <div class="breadcrumbs"><span>iRecon</span><span class="crumb-divider">/</span><strong>传输任务</strong></div>
         <div class="top-actions">
           <div class="local-status" :title="serviceMessage">
             <span class="pulse-dot" :class="{ online: serviceState === 'ready' }"></span>{{ serviceLabel }}
           </div>
           <button class="icon-button top-hotkey" title="全局快捷键" aria-label="全局快捷键" @click="toggleHotkey">
             <Settings2 :size="16" />
+          </button>
+          <button
+            class="icon-button theme-toggle"
+            :title="currentTheme === 'dark' ? '切换为浅色主题' : '切换为深色主题'"
+            :aria-label="currentTheme === 'dark' ? '切换为浅色主题' : '切换为深色主题'"
+            @click="toggleTheme"
+          >
+            <Sun v-if="currentTheme === 'dark'" :size="17" />
+            <Moon v-else :size="17" />
           </button>
           <button
             class="icon-button"
@@ -645,7 +835,7 @@ onUnmounted(() => {
             </div>
           </div>
           <ol class="help-steps">
-            <li><span class="step-index">1</span><span><strong>选择文件</strong>：点「选择文件」，也可以点「选文件夹」发送整个文件夹。</span></li>
+            <li><span class="step-index">1</span><span><strong>添加文件</strong>：点「添加文件」可单选或多选；点「添加文件夹」可添加整个目录。两者可以一起添加，内容会进入同一个列表。</span></li>
             <li><span class="step-index">2</span><span><strong>选择接收电脑</strong>：首次使用先填写对方电脑的 IP 地址、用户名和保存位置，点「保存这台电脑」。</span></li>
             <li><span class="step-index">3</span><span><strong>开始发送</strong>：点绿色「开始发送」按钮，等待进度到 100%。</span></li>
           </ol>
@@ -704,8 +894,8 @@ onUnmounted(() => {
                 title="登录接收电脑时使用的账户名。" />
             </label>
             <label class="field wide"><span>文件保存到哪个文件夹</span>
-              <input v-model="form.remoteDir" :disabled="isLocked" placeholder="例如：D:/LANDrop"
-                title="接收电脑上的文件夹，不存在会自动创建；Windows 路径写成 D:/LANDrop 这种形式。" />
+              <input v-model="form.remoteDir" :disabled="isLocked" placeholder="例如：D:/iRecon"
+                title="接收电脑上的文件夹，不存在会自动创建；Windows 路径写成 D:/iRecon 这种形式。" />
             </label>
           </div>
           <div class="auth-row">
@@ -811,6 +1001,10 @@ onUnmounted(() => {
                 <button class="inline-action" @click="chooseScheduleFolder">文件夹</button>
               </div>
             </label>
+            <label v-if="scheduleDraft.recursive" class="field wide"><span>远端文件夹名</span>
+              <input v-model="scheduleDraft.remoteName" placeholder="例如 {date}_项目备份" />
+              <small class="field-hint">使用 {date} 会在每次运行时替换为当天日期；留空则使用默认的 日期_文件夹名。</small>
+            </label>
             <label class="field"><span>目标设备</span>
               <select v-model="scheduleDraft.deviceId" class="log-select">
                 <option v-for="device in devices" :key="device.id" :value="device.id">{{ device.name || device.host }}</option>
@@ -860,6 +1054,7 @@ onUnmounted(() => {
               <span class="schedule-copy">
                 <strong>{{ item.name }}</strong>
                 <small>{{ fileName(item.source_path) }} · {{ deviceLabel(item.device_id) }} · {{ scheduleModeLabel(item) }}</small>
+                <small v-if="item.recursive" class="schedule-meta">远端文件夹：{{ item.remote_name || '默认（日期_文件夹名）' }}</small>
                 <small class="schedule-meta">
                   下次：{{ scheduleNextLabel(item.id) }}
                   <template v-if="scheduleLastRun(item).at"> · 上次：{{ scheduleStatusLabel(scheduleLastRun(item).status) }}</template>
@@ -911,7 +1106,7 @@ onUnmounted(() => {
               <span class="step-index">
                 <CheckCircle2 v-if="queue.length > 0" :size="14" />
                 <template v-else>1</template>
-              </span><span>选择文件</span>
+              </span><span>添加文件或文件夹</span>
             </div>
             <span class="step-connector"></span>
             <div class="step-item" :class="{ active: currentStep === 2, done: setupComplete }">
@@ -927,16 +1122,16 @@ onUnmounted(() => {
           </div>
           <div class="send-controls">
             <div class="source-picker-group">
-              <button class="file-picker" :disabled="isLocked" @click="chooseFile">
-                <span class="file-picker-icon"><FolderOpen :size="18" /></span>
+              <button class="file-picker" :disabled="isLocked" title="添加文件（支持单选或多选）" @click="chooseFile">
+                <span class="file-picker-icon"><File :size="18" /></span>
                 <span class="file-picker-copy">
-                  <strong>第 1 步 · 选择文件</strong>
-                  <small>{{ queue.length ? `已选 ${queue.length} 项，可以继续添加` : '可以多选，也可以选整个文件夹' }}</small>
+                  <strong>第 1 步 · 添加文件</strong>
+                  <small>{{ queue.length ? `已添加 ${queue.length} 项，可继续添加` : '支持单/多选' }}</small>
                 </span>
-                <span class="picker-key">选择</span>
+                <span class="picker-key">添加</span>
               </button>
-              <button class="folder-action" :disabled="isLocked" title="选择整个文件夹" aria-label="选择整个文件夹" @click="chooseFolder">
-                <Folder :size="16" /><span>选文件夹</span>
+              <button class="folder-action" :disabled="isLocked" title="添加整个文件夹" aria-label="添加整个文件夹" @click="chooseFolder">
+                <Folder :size="16" /><span>添加文件夹</span>
               </button>
             </div>
             <div class="control-divider"><span></span></div>
@@ -958,6 +1153,10 @@ onUnmounted(() => {
             <span v-if="sendBlockReason">{{ sendBlockReason }}</span>
             <span v-else>将发送到 {{ form.deviceName || form.host }}</span>
           </p>
+          <p v-if="folderBatch.running" class="send-hint folder-batch-hint">
+            <RefreshCw :size="13" class="spinning" />
+            <span>正在读取文件夹 {{ Math.min(folderBatch.done + 1, folderBatch.total) }}/{{ folderBatch.total }}…</span>
+          </p>
           <div v-if="queue.length" class="queue-panel">
             <div class="queue-head">
               <span class="queue-title">
@@ -976,15 +1175,20 @@ onUnmounted(() => {
                 </span>
                 <span class="queue-copy">
                   <strong>{{ fileName(item.path) }}</strong>
-                  <small>
-                    <template v-if="item.kind === 'folder'">{{ item.fileCount }} 个文件 · {{ formatBytes(item.size) }}</template>
+                  <small :title="item.kind === 'folder' ? item.remoteName : undefined">
+                    <template v-if="item.kind === 'folder'">{{ item.fileCount }} 个文件 · {{ formatBytes(item.size) }} · 远端：{{ item.remoteName || '默认' }}</template>
                     <template v-else>{{ item.path }}</template>
                     <template v-if="item.error"> · {{ item.error }}</template>
                   </small>
                 </span>
-                <button v-if="!batch.running" class="icon-button small" title="从列表移除" aria-label="从列表移除" @click="removeSource(item.key)">
-                  <X :size="13" />
-                </button>
+                <span v-if="!batch.running" class="queue-row-actions">
+                  <button v-if="item.kind === 'folder'" class="icon-button small" title="修改远端文件夹名" aria-label="修改远端文件夹名" @click="editFolderName(item)">
+                    <Settings2 :size="13" />
+                  </button>
+                  <button class="icon-button small" title="从列表移除" aria-label="从列表移除" @click="removeSource(item.key)">
+                    <X :size="13" />
+                  </button>
+                </span>
               </div>
             </div>
             <div v-if="batch.running || batchMessage" class="queue-foot">
@@ -992,9 +1196,9 @@ onUnmounted(() => {
               <span v-else>{{ batchMessage }}</span>
               <button
                 v-if="!batch.running && hasTargetConflicts"
-                class="inline-action trust"
+                class="primary-button queue-overwrite"
                 @click="retryFailedWithOverwrite"
-              >覆盖并重发</button>
+              ><RefreshCw :size="16" />覆盖并重发</button>
             </div>
           </div>
           <div class="destination-row">
@@ -1022,8 +1226,11 @@ onUnmounted(() => {
             </div>
             <div class="active-actions">
               <button v-if="selectedTask.status === 'running' || selectedTask.status === 'queued'" class="inline-action danger" @click="cancelActive">停止发送</button>
-              <button v-if="selectedTask.status === 'failed' || selectedTask.status === 'cancelled'" class="inline-action" :disabled="busy" @click="retryActive">
-                <RefreshCw :size="13" />重新发送
+              <button v-if="selectedTask.status === 'failed' || selectedTask.status === 'cancelled' || selectedTask.status === 'partial'" class="inline-action retry-action" :disabled="busy" @click="retryActive()">
+                <RefreshCw :size="14" />重新发送
+              </button>
+              <button v-if="selectedTask.status === 'failed' || selectedTask.status === 'cancelled' || selectedTask.status === 'partial'" class="inline-action retry-action" :disabled="busy" title="覆盖远端同名文件后重试" @click="retryActive(true)">
+                <RefreshCw :size="14" />覆盖重试
               </button>
             </div>
           </div>
@@ -1103,9 +1310,49 @@ onUnmounted(() => {
             <Wifi :size="15" /><span>文件只在你和对方电脑之间传输</span>
             <span class="info-separator">·</span><span>{{ serviceState === 'ready' ? '应用运行正常' : '应用未就绪' }}</span>
           </div>
-          <span class="version-button">v0.2.0</span>
+          <span class="version-button">v0.4.8</span>
         </footer>
       </div>
     </main>
   </div>
+
+  <Teleport to="body">
+    <div v-if="folderDialog" class="modal-backdrop" @click.self="closeFolderDialog">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="folder-dialog-title">
+        <div class="modal-head">
+          <h3 id="folder-dialog-title">{{ folderDialog.mode === 'rename' ? '修改远端文件夹名' : '远端文件夹名' }}</h3>
+          <button class="text-button" title="关闭" aria-label="关闭" @click="closeFolderDialog"><X :size="16" /></button>
+        </div>
+        <p class="modal-copy">本地文件夹：<code>{{ fileName(folderDialog.path) }}</code></p>
+        <label class="field">
+          <span>远端文件夹名</span>
+          <input
+            ref="folderDialogInput"
+            v-model="folderDialogName"
+            maxlength="255"
+            placeholder="例如 2026-11-17_project"
+            @keydown.enter.prevent="confirmFolderDialog"
+            @keydown.esc.prevent="closeFolderDialog"
+          />
+        </label>
+        <p class="modal-hint">默认格式：日期_文件夹名；不能包含 / \ : * ? " &lt; &gt; |，也不能使用 Windows 保留名称。</p>
+        <p v-if="folderDialogError" class="modal-error">{{ folderDialogError }}</p>
+        <div class="modal-actions">
+          <button class="inline-action" :disabled="folderDialogBusy" @click="closeFolderDialog">取消</button>
+          <button class="primary-button" :disabled="folderDialogBusy" @click="confirmFolderDialog">
+            {{ folderDialogBusy ? '添加中…' : '确定' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <FilePickerDialog
+    v-if="picker"
+    :mode="picker.mode"
+    :multiple="picker.multiple"
+    :title="picker.title"
+    @close="closePicker"
+    @confirm="handlePickerConfirm"
+  />
 </template>

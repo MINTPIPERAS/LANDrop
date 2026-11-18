@@ -78,7 +78,7 @@ fn app_data_dir() -> PathBuf {
     std::env::var("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("LANDrop")
+        .join("iRecon")
 }
 
 /// The configured log directory, falling back to the default location.
@@ -117,10 +117,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &logs, &separator, &quit])?;
 
-    let mut builder = TrayIconBuilder::with_id("landrop")
+    let mut builder = TrayIconBuilder::with_id("irecon")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("LANDrop")
+        .tooltip("iRecon")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => reveal_window(app),
             "logs" => open_logs(),
@@ -212,7 +212,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building LANDrop desktop application")
+        .expect("error while building iRecon desktop application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 app_handle.state::<service::ServiceState>().stop();

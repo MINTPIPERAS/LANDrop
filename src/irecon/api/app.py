@@ -26,9 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from landrop import credentials, hostkeys, logs, scheduler
-from landrop.config import AppConfig, load_config, parse_schedule_time, save_config
-from landrop.transfer import (
+from irecon import browse, credentials, hostkeys, logs, scheduler
+from irecon.config import AppConfig, load_config, parse_schedule_time, save_config
+from irecon.transfer import (
     TransferCancelled,
     TransferError,
     TransferResult,
@@ -37,10 +37,11 @@ from landrop.transfer import (
     upload_file,
     upload_tree,
 )
+from irecon.transfer.naming import resolve_remote_name
 
-# Fixed name: ``python -m landrop.api.app`` would otherwise report __main__ and
+# Fixed name: ``python -m irecon.api.app`` would otherwise report __main__ and
 # inherit the root WARNING level, silently dropping every INFO record in dev.
-logger = logging.getLogger("landrop.api.app")
+logger = logging.getLogger("irecon.api.app")
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "partial"}
 
@@ -62,8 +63,8 @@ class ServiceConfig:
     @classmethod
     def from_environment(cls) -> ServiceConfig:
         try:
-            port = int(os.environ["LANDROP_SERVICE_PORT"])
-            token = os.environ["LANDROP_SERVICE_TOKEN"]
+            port = int(os.environ["IRECON_SERVICE_PORT"])
+            token = os.environ["IRECON_SERVICE_TOKEN"]
         except (KeyError, ValueError) as exc:
             raise RuntimeError("本机服务启动参数缺失或格式无效") from exc
         if not 1 <= port <= 65535:
@@ -80,6 +81,7 @@ class TransferRequest(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     username: str = Field(min_length=1, max_length=255)
     remote_dir: str = Field(min_length=1, max_length=2048)
+    remote_name: str | None = Field(default=None, max_length=255)
     local_path: str = Field(min_length=1, max_length=32767)
     auth_method: Literal["key", "password"] = "key"
     password: SecretStr | None = None
@@ -91,6 +93,15 @@ class TransferRequest(BaseModel):
     @field_validator("host", "username", "remote_dir", "local_path")
     @classmethod
     def reject_control_characters(cls, value: str) -> str:
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("字段中不能包含控制字符")
+        return value.strip()
+
+    @field_validator("remote_name")
+    @classmethod
+    def normalize_remote_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if any(ord(character) < 32 for character in value):
             raise ValueError("字段中不能包含控制字符")
         return value.strip()
@@ -107,6 +118,7 @@ class RetryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     password: SecretStr | None = None
+    overwrite: bool | None = None
 
 
 class HostKeyRequest(BaseModel):
@@ -187,6 +199,7 @@ class TransferTask:
                 "port": self.request.port,
                 "username": self.request.username,
                 "remote_dir": self.request.remote_dir,
+                "remote_name": self.request.remote_name,
                 "local_path": self.request.local_path,
                 "auth_method": self.request.auth_method,
                 "private_key_path": self.request.private_key_path,
@@ -209,7 +222,7 @@ class TransferManager:
     def __init__(self, max_workers: int = 2) -> None:
         self._tasks: dict[str, TransferTask] = {}
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="landrop-transfer")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="irecon-transfer")
 
     def start(self, request: TransferRequest, *, source: str = "manual") -> TransferTask:
         local_path = Path(request.local_path).expanduser().resolve()
@@ -218,6 +231,11 @@ class TransferManager:
                 raise ValueError("选择的本地文件夹不存在或不是目录")
         elif not local_path.is_file():
             raise ValueError("选择的本地文件不存在或不是普通文件")
+        resolved_name: str | None = None
+        if request.recursive:
+            # Resolve once at task creation so a retry after midnight reuses the
+            # same remote folder and can still resume its .part files.
+            resolved_name = resolve_remote_name(request.remote_name, local_path)
         total = _source_total(request)
         if request.auth_method == "key" and request.private_key_path:
             if not Path(request.private_key_path).expanduser().is_file():
@@ -231,8 +249,9 @@ class TransferManager:
         if password is not None and request.remember_password:
             credentials.save_password(request.host, request.port, request.username, password)
 
-        # Keep credentials out of the retained request object.
-        stored = request.model_copy(update={"password": None})
+        # Keep credentials out of the retained request object. The resolved
+        # folder name is stored so retries target the same remote directory.
+        stored = request.model_copy(update={"password": None, "remote_name": resolved_name})
         task = TransferTask(
             task_id=uuid.uuid4().hex,
             request=stored,
@@ -256,7 +275,12 @@ class TransferManager:
         )
         return task
 
-    def retry(self, task_id: str, password: str | None = None) -> TransferTask | None:
+    def retry(
+        self,
+        task_id: str,
+        password: str | None = None,
+        overwrite: bool | None = None,
+    ) -> TransferTask | None:
         previous = self.get(task_id)
         if previous is None:
             return None
@@ -264,6 +288,8 @@ class TransferManager:
             if previous.status not in TERMINAL_STATUSES:
                 raise ValueError("只有已结束的任务才能重试")
             request = previous.request.model_copy(deep=True)
+        if overwrite is not None:
+            request = request.model_copy(update={"overwrite": overwrite})
         if request.auth_method == "password" and password is None:
             password = credentials.load_password(request.host, request.port, request.username)
         if request.auth_method == "password" and password is None:
@@ -340,6 +366,7 @@ class TransferManager:
                 tree_result = upload_tree(
                     host=request.host, port=request.port, username=request.username,
                     local_path=request.local_path, remote_dir=request.remote_dir,
+                    remote_name=request.remote_name,
                     auth_method=request.auth_method,
                     password=task.password,
                     private_key_path=request.private_key_path,
@@ -370,7 +397,6 @@ class TransferManager:
                     cancel=task.cancel_event, overwrite=request.overwrite,
                     known_hosts_path=known_hosts,
                 )
-                task.publish(phase="verifying", message="校验文件")
                 task.publish(status="succeeded", phase="completed", sent=result.size, total=result.size,
                              speed=0.0, message="传输完成", result=_serialize_result(result))
         except TransferCancelled as exc:
@@ -416,6 +442,7 @@ def _serialize_tree_result(result: TreeResult) -> dict[str, Any]:
                 "remote_path": item.remote_path,
                 "size": item.size,
                 "ok": item.ok,
+                "skipped": item.skipped,
                 "error": item.error,
                 "error_code": item.error_code,
             }
@@ -542,7 +569,7 @@ def create_app(
             if manager is None:
                 await asyncio.to_thread(transfer_manager.close)
 
-    app = FastAPI(title="LANDrop local service", docs_url=None, redoc_url=None,
+    app = FastAPI(title="iRecon local service", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
     app.state.session_token = session_token
     app.state.transfer_manager = transfer_manager
@@ -552,7 +579,7 @@ def create_app(
         allow_origins=sorted(ALLOWED_ORIGINS),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "X-LANDrop-Token", "Authorization", "Last-Event-ID"],
+        allow_headers=["Content-Type", "X-iRecon-Token", "Authorization", "Last-Event-ID"],
         expose_headers=["Content-Type"],
     )
 
@@ -575,10 +602,10 @@ def create_app(
 
     async def require_token(
         authorization: Annotated[str | None, Header()] = None,
-        x_landrop_token: Annotated[str | None, Header(alias="X-LANDrop-Token")] = None,
+        x_irecon_token: Annotated[str | None, Header(alias="X-iRecon-Token")] = None,
     ) -> None:
         bearer = authorization.removeprefix("Bearer ") if authorization and authorization.startswith("Bearer ") else None
-        supplied = x_landrop_token or bearer
+        supplied = x_irecon_token or bearer
         if not supplied or not hmac.compare_digest(supplied, app.state.session_token):
             raise HTTPException(status_code=401, detail="本机会话令牌无效",
                                 headers={"WWW-Authenticate": "Bearer"})
@@ -759,6 +786,20 @@ def create_app(
             "skipped": list(result.skipped),
         }
 
+    @app.get("/api/fs/list", dependencies=protected)
+    async def fs_list(path: str, limit: int = browse.DEFAULT_LIMIT) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(browse.list_local_directory, path, limit)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/fs/roots", dependencies=protected)
+    async def fs_roots() -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(browse.list_local_roots)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/transfers", status_code=202, dependencies=protected)
     async def create_transfer(payload: TransferRequest) -> dict[str, Any]:
         try:
@@ -782,8 +823,11 @@ def create_app(
     @app.post("/api/transfers/{task_id}/retry", status_code=202, dependencies=protected)
     async def retry_transfer(task_id: str, payload: RetryRequest | None = None) -> dict[str, Any]:
         password = payload.password.get_secret_value() if payload and payload.password else None
+        overwrite = payload.overwrite if payload else None
         try:
-            task = await asyncio.to_thread(transfer_manager.retry, task_id, password)
+            task = await asyncio.to_thread(
+                transfer_manager.retry, task_id, password, overwrite
+            )
         except (ValueError, credentials.CredentialError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if task is None:
@@ -852,6 +896,7 @@ class SchedulePayload(BaseModel):
     recursive: bool = False
     device_id: str = Field(default="", max_length=64)
     remote_dir: str = Field(default="", max_length=2048)
+    remote_name: str = Field(default="", max_length=255)
     overwrite: bool = False
     mode: Literal["once", "daily", "weekly"] = "once"
     time: str = Field(default="09:00", max_length=5)
@@ -915,6 +960,7 @@ def _serialize_config(config: AppConfig) -> dict[str, Any]:
                 "recursive": schedule.recursive,
                 "device_id": schedule.device_id,
                 "remote_dir": schedule.remote_dir,
+                "remote_name": schedule.remote_name,
                 "overwrite": schedule.overwrite,
                 "mode": schedule.mode,
                 "time": schedule.time,
@@ -970,7 +1016,7 @@ def run() -> None:
         logger.info("应用正在运行，跳过本次定时任务 %s", schedule_id)
         raise SystemExit(0)
     if not acquired:
-        logger.warning("另一个 LANDrop 实例正在运行，本实例仍会启动")
+        logger.warning("另一个 iRecon 实例正在运行，本实例仍会启动")
     try:
         if schedule_id is not None:
             raise SystemExit(scheduler.run_once(schedule_id))

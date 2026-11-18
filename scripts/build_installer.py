@@ -6,7 +6,7 @@ Run from the repository root::
     python scripts/build_installer.py
 
 The order matters: the Tauri resource mapping embeds
-``src-tauri/sidecar/landrop-service``, so the sidecar must exist before the
+``src-tauri/sidecar/irecon-service``, so the sidecar must exist before the
 bundle step runs.
 """
 
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SIDECAR = ROOT / "src-tauri" / "sidecar" / "landrop-service" / "landrop-service.exe"
+SIDECAR = ROOT / "src-tauri" / "sidecar" / "irecon-service" / "irecon-service.exe"
 INSTALLER_DIR = ROOT / "src-tauri" / "target" / "release" / "bundle"
 
 
@@ -40,7 +40,7 @@ def main() -> int:
     run(
         [sys.executable, "-m", "PyInstaller", "--noconfirm",
          "--distpath", "src-tauri/sidecar", "--workpath", "build",
-         "landrop-service.spec"],
+         "irecon-service.spec"],
         "打包 Python 传输服务 (PyInstaller onedir)",
     )
     if not SIDECAR.is_file():

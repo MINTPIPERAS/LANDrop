@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "landrop"
-version = "0.2.0"
-description = "Python transfer service for LANDrop desktop"
+name = "irecon"
+version = "0.4.8"
+description = "Python transfer service for iRecon desktop"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -25,7 +25,7 @@ dev = [
 ]
 
 [project.scripts]
-landrop-service = "landrop.api.app:run"
+irecon-service = "irecon.api.app:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

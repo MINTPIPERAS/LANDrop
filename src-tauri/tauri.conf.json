@@ -1,7 +1,7 @@
 {
-  "productName": "LANDrop",
-  "version": "0.2.0",
-  "identifier": "com.landrop.desktop",
+  "productName": "iRecon",
+  "version": "0.4.8",
+  "identifier": "com.irecon.desktop",
   "build": {
     "beforeDevCommand": "npm run dev -- --port 1424",
     "devUrl": "http://127.0.0.1:1424",
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "LANDrop",
+        "title": "iRecon",
         "width": 1180,
         "height": 800,
         "minWidth": 740,
@@ -19,6 +19,8 @@
         "resizable": true,
         "fullscreen": false,
         "decorations": true,
+        "theme": "Dark",
+        "backgroundColor": "#0b0d10",
         "visible": false
       }
     ],
@@ -33,7 +35,7 @@
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "shortDescription": "Secure local network file transfer",
     "resources": {
-      "sidecar/landrop-service/": "landrop-service/"
+      "sidecar/irecon-service/": "irecon-service/"
     }
   }
 }

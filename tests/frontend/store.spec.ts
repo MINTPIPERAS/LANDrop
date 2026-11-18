@@ -65,7 +65,7 @@ describe('transfer store', () => {
 
     expect(store.serviceState.value).toBe('ready')
     expect(store.form.host).toBe('192.168.1.23')
-    expect(fetchMock.mock.calls[0][1].headers['X-LANDrop-Token']).toBe('t'.repeat(48))
+    expect(fetchMock.mock.calls[0][1].headers['X-iRecon-Token']).toBe('t'.repeat(48))
   })
 
   it('surfaces service startup failures without crashing', async () => {
@@ -130,7 +130,29 @@ describe('transfer store', () => {
       size: 2048,
       fileCount: 12,
     })
+    expect(store.queue.value[0].remoteName).toMatch(/^\d{4}-\d{2}-\d{2}_project$/)
     expect(store.queueSummary.value).toEqual({ count: 1, size: 2048 })
+  })
+
+  it('stores a manually supplied remote folder name', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          root: 'D:/project',
+          total_files: 1,
+          total_size: 10,
+          empty_dirs: 0,
+          skipped: [],
+        }),
+        { status: 200 },
+      ),
+    )
+    const store = await import('../../src/frontend/store/transfer')
+
+    const error = await store.addFolder('D:/project', '2026-11-17_backup')
+
+    expect(error).toBeNull()
+    expect(store.queue.value[0].remoteName).toBe('2026-11-17_backup')
   })
 
   it('deduplicates queued paths case-insensitively', async () => {
@@ -145,6 +167,17 @@ describe('transfer store', () => {
 
     store.clearQueue()
     expect(store.queue.value).toEqual([])
+  })
+
+  it('validates remote folder names', async () => {
+    const store = await import('../../src/frontend/store/transfer')
+
+    expect(store.validateRemoteName('2026-11-17 项目备份')).toBeNull()
+    expect(store.validateRemoteName('{date}_project', true)).toBeNull()
+    expect(store.validateRemoteName('a/b')).toContain('不能包含')
+    expect(store.validateRemoteName('..')).toContain('不能是')
+    expect(store.validateRemoteName('CON')).toContain('保留名称')
+    expect(store.validateRemoteName('')).toContain('请输入')
   })
 
   it('marks folders as recursive in the transfer payload', async () => {
@@ -164,15 +197,18 @@ describe('transfer store', () => {
     expect(filePayload.recursive).toBe(false)
     expect(filePayload.local_path).toBe('C:/tmp/a.bin')
     expect(filePayload.password).toBe('secret')
+    expect(filePayload.remote_name).toBeUndefined()
 
     const folderPayload = store.transferPayload({
       path: 'C:/tmp/project',
       kind: 'folder',
       size: 100,
       fileCount: 3,
+      remoteName: '2026-11-17_project',
     })
     expect(folderPayload.recursive).toBe(true)
     expect(folderPayload.local_path).toBe('C:/tmp/project')
+    expect(folderPayload.remote_name).toBe('2026-11-17_project')
 
     store.form.authMethod = 'key'
     store.form.privateKeyPath = 'C:/keys/id'
@@ -384,8 +420,43 @@ describe('transfer store', () => {
       device_id: 'd1',
       mode: 'daily',
       enabled: true,
+      remote_name: '',
     })
     expect(saved!.schedules[0].weekdays).toEqual([])
+  })
+
+  it('persists a folder schedule remote name template', async () => {
+    const store = await import('../../src/frontend/store/transfer')
+    store.schedules.value = []
+    store.scheduleDraft.deviceId = 'd1'
+    store.scheduleDraft.sourcePath = 'C:/src/project'
+    store.scheduleDraft.recursive = true
+    store.scheduleDraft.remoteName = '{date}_project'
+    store.scheduleDraft.name = '项目备份'
+    store.scheduleDraft.mode = 'daily'
+    store.scheduleDraft.time = '09:00'
+
+    let saved: Record<string, any> | null = null
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET'
+      if (url.endsWith('/api/config') && method === 'PUT') {
+        saved = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(saved), { status: 200 })
+      }
+      if (url.endsWith('/api/schedules')) {
+        return new Response(
+          JSON.stringify({ schedules: [], system_tasks: false }),
+          { status: 200 },
+        )
+      }
+      throw new Error(`unexpected request: ${method} ${url}`)
+    })
+
+    const error = await store.addSchedule()
+
+    expect(error).toBeNull()
+    expect(saved!.schedules[0].recursive).toBe(true)
+    expect(saved!.schedules[0].remote_name).toBe('{date}_project')
   })
 
   it('rejects a schedule without a source or target device', async () => {
@@ -610,7 +681,7 @@ describe('transfer store', () => {
     expect(store.sendBlockReason.value).toContain('启动')
 
     store.serviceState.value = 'ready'
-    expect(store.sendBlockReason.value).toContain('选择')
+    expect(store.sendBlockReason.value).toContain('请添加文件或文件夹；两者可以一起添加')
 
     store.queue.value = [
       { key: 'c:/tmp/file.bin', path: 'C:/tmp/file.bin', kind: 'file', size: 0, fileCount: 1 },
@@ -632,6 +703,7 @@ describe('transfer store', () => {
 
     expect(store.errorHint('auth_failed')).toContain('用户名')
     expect(store.errorHint('timeout')).toContain('网络')
+    expect(store.errorHint('remote_io')).toContain('文件操作失败')
     expect(store.errorHint(null)).toBeNull()
     expect(store.errorHint('unknown_code')).toBeNull()
   })
@@ -641,7 +713,7 @@ describe('transfer store', () => {
     store.form.deviceName = '书房电脑'
     store.form.host = '192.168.1.50'
     store.form.username = 'lin'
-    store.form.remoteDir = 'D:/LANDrop'
+    store.form.remoteDir = 'D:/iRecon'
 
     const saved: Record<string, unknown> = {}
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -675,7 +747,7 @@ describe('transfer store', () => {
     const store = await import('../../src/frontend/store/transfer')
     store.form.host = '192.168.1.51'
     store.form.username = 'lin'
-    store.form.remoteDir = 'D:/LANDrop'
+    store.form.remoteDir = 'D:/iRecon'
     store.form.authMethod = 'password'
     store.form.password = 'secret'
     store.form.rememberPassword = true
@@ -884,7 +956,7 @@ describe('transfer store', () => {
 
   it('persists log settings and refreshes the directory listing', async () => {
     const store = await import('../../src/frontend/store/transfer')
-    store.settings.logDir = 'D:/landrop-logs'
+    store.settings.logDir = 'D:/irecon-logs'
     store.settings.logRetentionDays = 7
 
     let saved: Record<string, unknown> | null = null
@@ -897,9 +969,9 @@ describe('transfer store', () => {
       if (url.endsWith('/api/logs')) {
         return new Response(
           JSON.stringify({
-            dir: 'D:/landrop-logs',
-            default_dir: 'C:/Users/ASUS/AppData/Roaming/LANDrop/logs',
-            files: [{ name: 'landrop.log', size: 10, modified: 1 }],
+            dir: 'D:/irecon-logs',
+            default_dir: 'C:/Users/ASUS/AppData/Roaming/iRecon/logs',
+            files: [{ name: 'irecon.log', size: 10, modified: 1 }],
             total_size: 10,
           }),
           { status: 200 },
@@ -911,7 +983,7 @@ describe('transfer store', () => {
     const error = await store.applyLogSettings()
 
     expect(error).toBeNull()
-    expect(saved!.log_dir).toBe('D:/landrop-logs')
+    expect(saved!.log_dir).toBe('D:/irecon-logs')
     expect(saved!.log_retention_days).toBe(7)
     expect(store.logsInfo.value?.total_size).toBe(10)
     expect(store.logsInfo.value?.files).toHaveLength(1)

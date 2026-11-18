@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from landrop.config import AppConfig, DeviceConfig, load_config, save_config
+from irecon.config import AppConfig, DeviceConfig, load_config, save_config
 
 
 def device(**overrides) -> DeviceConfig:

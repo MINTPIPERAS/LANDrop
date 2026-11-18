@@ -1,6 +1,6 @@
-# LANDrop
+# iRecon
 
-Windows 局域网文件传输工具，采用 **Vue 3 + Tauri 2 桌面壳 + Python 本地传输服务**。桌面应用启动时会自动拉起 Python sidecar，通过带会话令牌的 loopback API 驱动 Paramiko 完成 SSH/SFTP 单文件传输，支持断点续传与 SHA-256 校验。
+Windows 局域网文件传输工具，采用 **Vue 3 + Tauri 2 桌面壳 + Python 本地传输服务**。桌面应用启动时会自动拉起 Python sidecar，通过带会话令牌的 loopback API 驱动 Paramiko 完成 SSH/SFTP 单文件传输，支持断点续传；新文件边传边算 SHA-256 并校验远端长度，续传文件做双端完整校验。
 
 ## 当前进度
 
@@ -10,11 +10,13 @@ Windows 局域网文件传输工具，采用 **Vue 3 + Tauri 2 桌面壳 + Pytho
 - Python 服务由 Tauri 自动启动：随机端口、32 字节高熵令牌、`/health` 就绪探测、退出清理。
 - 本机 API 仅监听 `127.0.0.1`，校验令牌与请求来源，任务化传输、SSE 进度、取消、重试、错误映射。
 - Vue 界面已接入真实 API：连接配置、认证方式、主机指纹确认、文件选择、发送/取消/重试、进度与速度。
+- 文件夹整体复制到 `<目标目录>/<远端文件夹名>/`；添加文件夹时可命名（默认 `日期_文件夹名`），定时任务支持 `{date}` 按每次运行日期生成。
+- 自定义文件选择器：近 8/24 小时筛选、修改/创建时间切换、时间升/降序、全选当前目录、多选文件夹自动命名。
 - 全局快捷键从配置读取（默认 `Ctrl+Alt+Space`），启动即注册，界面内可修改；被占用时降级为普通窗口操作。
 - 真实 SFTP 端到端测试：新传、断点续传、主机密钥拒绝与变更、覆盖保护、认证失败。
 - 已产出 Windows NSIS 安装包，sidecar 为 PyInstaller onedir；安装/启动/卸载全流程已实测。
 
-尚未包含：多文件队列与设备发现、代码签名、自动更新。
+尚未包含：设备发现、代码签名、自动更新。
 
 ## 安装包
 
@@ -26,7 +28,9 @@ python -m pip install -e ".[dev]"
 npm run package
 ```
 
-产物：`src-tauri\target\release\bundle\nsis\LANDrop_0.2.0_x64-setup.exe`（约 19 MB）。
+产物：`src-tauri\target\release\bundle\nsis\iRecon_0.4.8_x64-setup.exe`（约 19 MB）。
+
+从旧版 LANDrop 升级时，建议先卸载旧版；旧数据、凭据、计划任务的清理方法见[升级与旧版清理](docs/升级与清理旧版.md)。
 
 打包分两步：PyInstaller 把 Python 服务打成 onedir 目录，再让 Tauri 收进安装包。首次打包 Tauri 需要从 GitHub 下载 NSIS，网络受限时见[技术实现](docs/技术实现.md)第 12.4 节。
 
@@ -49,7 +53,7 @@ npm install
 npm run tauri dev
 ```
 
-桌面应用会自动启动 Python 服务。开发模式下 Rust 侧调用 `python -m landrop.api.app`（需已安装 Python 依赖），并通过 `PYTHONPATH` 指向 `src/`；可用环境变量 `LANDROP_PYTHON` 指定解释器路径。
+桌面应用会自动启动 Python 服务。开发模式下 Rust 侧调用 `python -m irecon.api.app`（需已安装 Python 依赖），并通过 `PYTHONPATH` 指向 `src/`；可用环境变量 `IRECON_PYTHON` 指定解释器路径。
 
 只预览界面（不启动 Tauri）可运行 `npm run dev`，浏览器打开 `http://127.0.0.1:1424`。此时没有 Tauri 桥接，界面会提示「浏览器预览模式」，只能查看布局，不能传输。
 
@@ -68,9 +72,9 @@ npm run build         # TypeScript 类型检查 + 生产构建
 调试服务本身时可手工启动。服务只绑定 `127.0.0.1`，所有请求必须带令牌：
 
 ```powershell
-$env:LANDROP_SERVICE_PORT = "43127"
-$env:LANDROP_SERVICE_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
-python -m landrop.api.app
+$env:IRECON_SERVICE_PORT = "43127"
+$env:IRECON_SERVICE_TOKEN = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))
+python -m irecon.api.app
 ```
 
 接口一览：
@@ -88,13 +92,13 @@ python -m landrop.api.app
 | POST | `/api/transfers/{id}/cancel` | 取消，保留远端 `.part` |
 | POST | `/api/transfers/{id}/retry` | 以新任务重试 |
 
-所有接口都要求 `X-LANDrop-Token` 或 `Authorization: Bearer <token>`。密码只在创建/重试请求中短暂传递，不写入日志、快照或 URL。
+所有接口都要求 `X-iRecon-Token` 或 `Authorization: Bearer <token>`。密码只在创建/重试请求中短暂传递，不写入日志、快照或 URL。
 
 ## 安全要点
 
 - 本机服务仅监听 loopback，非 loopback 客户端与未知 `Origin` 均被拒绝。
 - 主机密钥采用 trust-on-first-use：未知主机直接拒绝连接，需用户在界面确认指纹后写入应用私有的 `known_hosts`；指纹变化时拒绝保存。
-- 应用私有 `known_hosts` 位于 `%APPDATA%\LANDrop\known_hosts`，不修改用户的 `~/.ssh/known_hosts`。
+- 应用私有 `known_hosts` 位于 `%APPDATA%\iRecon\known_hosts`，不修改用户的 `~/.ssh/known_hosts`。
 - 密码持久化仅通过 Windows Credential Manager。
 - sidecar 被放入 Windows Job Object（kill-on-close），即使宿主进程崩溃或被强制结束，Python 子进程也会一并退出。
 
@@ -107,4 +111,5 @@ python -m landrop.api.app
 - [技术实现](docs/技术实现.md)
 - [应用使用指南](docs/应用使用指南.md)
 - [新机部署验证](docs/新机部署验证.md) — 全新机器从零配置到传输验收，含单机自测
+- [升级与旧版清理](docs/升级与清理旧版.md) — 从 LANDrop 升级、卸载旧版与清理旧数据/凭据/计划任务
 - [SSH 密钥生成与配置](docs/密钥生成.md)

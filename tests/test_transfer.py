@@ -6,7 +6,7 @@ from pathlib import Path
 import paramiko
 import pytest
 
-from landrop.transfer import TransferCancelled, TransferError, upload_file
+from irecon.transfer import TransferCancelled, TransferError, upload_file
 
 from fake_sftp import FakeSFTP, FakeSSHClient
 
@@ -35,15 +35,53 @@ def test_new_upload_verifies_and_publishes(tmp_path):
     assert result.sha256 == hashlib.sha256(data).hexdigest()
     assert result.resumed_from == 0
     assert sftp.files == {result.remote_path: data}
-    assert sftp.opens[0] == (result.remote_path + ".landrop.part", "ab")
+    assert sftp.opens[0] == (result.remote_path + ".irecon.part", "ab")
+    # Fast path: a new upload must not read the remote temporary file back.
+    assert (result.remote_path + ".irecon.part", "rb") not in sftp.opens
     assert client.loaded_system_keys
     assert isinstance(client.policy, paramiko.RejectPolicy)
     assert sftp.closed and client.closed
 
 
+def test_new_empty_file_is_published(tmp_path):
+    result, _, sftp, _ = run_upload(tmp_path, b"")
+
+    assert result.size == 0
+    assert result.resumed_from == 0
+    assert result.sha256 == hashlib.sha256(b"").hexdigest()
+    assert sftp.files[result.remote_path] == b""
+
+
+def test_existing_empty_partial_is_verified_and_published(tmp_path):
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
+    result, _, sftp, _ = run_upload(tmp_path, b"", {partial: b""})
+
+    assert result.resumed_from == 0
+    assert sftp.files[result.remote_path] == b""
+
+
+def test_empty_file_can_overwrite_an_existing_target(tmp_path):
+    final = "/home/alice/Downloads/payload.bin"
+    result, _, sftp, _ = run_upload(tmp_path, b"", {final: b"old"}, overwrite=True)
+
+    assert sftp.files[result.remote_path] == b""
+
+
+def test_new_upload_skips_full_verification_progress(tmp_path):
+    updates: list[tuple[int, int]] = []
+
+    run_upload(
+        tmp_path,
+        b"new file contents",
+        verify_progress=lambda done, total: updates.append((done, total)),
+    )
+
+    assert updates == []
+
+
 def test_resumes_from_partial_file_and_reports_total_progress(tmp_path):
     data = b"abcdefghij"
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     result, _, sftp, _ = run_upload(tmp_path, data, {partial: b"abcd"})
 
     assert result.resumed_from == 4
@@ -53,7 +91,7 @@ def test_resumes_from_partial_file_and_reports_total_progress(tmp_path):
 
 def test_partial_equal_to_local_is_verified_before_publish(tmp_path):
     data = b"complete already"
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     result, _, sftp, _ = run_upload(tmp_path, data, {partial: data})
 
     assert result.resumed_from == len(data)
@@ -62,7 +100,7 @@ def test_partial_equal_to_local_is_verified_before_publish(tmp_path):
 
 
 def test_larger_partial_is_rejected_and_preserved(tmp_path):
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     with pytest.raises(TransferError, match="大于本地文件"):
         run_upload(tmp_path, b"small", {partial: b"too much data"})
 
@@ -85,7 +123,7 @@ def test_unsupported_atomic_overwrite_keeps_old_file_and_partial(tmp_path):
     local = tmp_path / "payload.bin"
     local.write_bytes(b"replacement")
     final = "/home/alice/Downloads/payload.bin"
-    partial = final + ".landrop.part"
+    partial = final + ".irecon.part"
     sftp = FakeSFTP({final: b"old"}, posix_rename_supported=False)
     client = FakeSSHClient(sftp)
 
@@ -114,13 +152,13 @@ def test_cancellation_preserves_partial_and_closes_connections(tmp_path):
             client_factory=lambda: client,
         )
 
-    assert sftp.files["/home/alice/Downloads/payload.bin.landrop.part"] == b"cancel me"
+    assert sftp.files["/home/alice/Downloads/payload.bin.irecon.part"] == b"cancel me"
     assert sftp.closed and client.closed
 
 
 def test_remote_hash_mismatch_does_not_publish(tmp_path):
     data = b"source data"
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     with pytest.raises(TransferError, match="校验失败"):
         run_upload(tmp_path, data, {partial: b"other data"})
 
@@ -173,7 +211,7 @@ def test_invalid_authentication_is_rejected(tmp_path):
 
 def test_progress_starts_at_resume_offset(tmp_path):
     data = b"abcdefgh"
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     local = tmp_path / "payload.bin"
     local.write_bytes(data)
     updates = []
@@ -223,7 +261,7 @@ def test_target_exists_carries_a_stable_error_code(tmp_path):
 
 
 def test_hash_mismatch_carries_a_stable_error_code(tmp_path):
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
 
     with pytest.raises(TransferError) as excinfo:
         run_upload(tmp_path, b"source data", {partial: b"other data"})
@@ -264,11 +302,14 @@ def test_timeout_is_classified(tmp_path):
 
 def test_verify_progress_is_monotonic(tmp_path):
     data = b"x" * 3_000_000
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     updates: list[tuple[int, int]] = []
 
+    # A resumed upload keeps the full two-sided verification.
     run_upload(
         tmp_path,
         data,
+        {partial: data[:1_000_000]},
         verify_progress=lambda done, total: updates.append((done, total)),
     )
 
@@ -281,7 +322,7 @@ def test_verify_progress_is_monotonic(tmp_path):
 
 def test_complete_partial_reports_verify_progress(tmp_path):
     data = b"abcdefghij"
-    partial = "/home/alice/Downloads/payload.bin.landrop.part"
+    partial = "/home/alice/Downloads/payload.bin.irecon.part"
     updates: list[tuple[int, int]] = []
 
     run_upload(

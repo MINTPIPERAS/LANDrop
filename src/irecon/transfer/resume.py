@@ -13,11 +13,12 @@ from typing import Callable
 
 import paramiko
 
-from landrop.transfer.errors import TransferCancelled, TransferError
-from landrop.transfer.remote import (
+from irecon.transfer.errors import TransferCancelled, TransferError
+from irecon.transfer.remote import (
     classify_connection_error,
     connect_sftp,
     ensure_remote_dir,
+    is_connection_error,
     validate_connection,
 )
 
@@ -148,6 +149,35 @@ def _timed_verify(
     return pair
 
 
+def remote_file_matches(
+    sftp: paramiko.SFTPClient,
+    source_path: Path,
+    remote_path: str,
+    cancel_check: CancelCheck,
+) -> bool:
+    """Return True when the remote final file has the same size and SHA-256.
+
+    Used by directory retries to skip files that were already published by an
+    earlier attempt. A missing remote file is simply "not a match"; connection
+    failures still propagate so they cannot be mistaken for a content mismatch.
+    """
+    try:
+        remote_size = _stat_size(sftp, remote_path)
+    except OSError as exc:
+        if is_connection_error(exc):
+            raise
+        return False
+    if remote_size is None or remote_size != source_path.stat().st_size:
+        return False
+
+    try:
+        local_hash = _digest_local(source_path, cancel_check)
+        remote_hash = _digest_remote(sftp, remote_path, cancel_check)
+    except FileNotFoundError:
+        return False
+    return local_hash == remote_hash
+
+
 def _check_cancel(cancel_check: CancelCheck) -> None:
     if cancel_check():
         raise TransferCancelled("传输已取消，已保留远端临时文件")
@@ -201,12 +231,14 @@ def upload_one(
     """Upload one local file over an existing session.
 
     ``remote_dir`` must already exist; the directory transfer creates parents
-    once and then reuses the session for every file.
+    once and then reuses the session for every file. New files are hashed while
+    streaming and checked by remote length; resumed files get a full two-sided
+    SHA-256 check.
     """
     check = cancel_check or (lambda: False)
     base_dir = remote_dir.rstrip("/") or "/"
     final_path = posixpath.join(base_dir, source_path.name)
-    partial_path = final_path + ".landrop.part"
+    partial_path = final_path + ".irecon.part"
     initial_signature = _source_signature(source_path)
     total = initial_signature[0]
 
@@ -221,6 +253,12 @@ def upload_one(
             code="state_conflict",
         )
     if offset == total:
+        if total == 0:
+            # A brand-new empty file never entered the upload branch above, so
+            # its .part file does not exist yet. Create it before verification
+            # and publishing; opening an existing empty .part is harmless.
+            with sftp.open(partial_path, "ab"):
+                pass
         if _source_signature(source_path) != initial_signature:
             raise TransferError(
                 "本地文件在校验前发生变化，请重新选择文件", code="local_changed"
@@ -234,6 +272,11 @@ def upload_one(
                 code="verify_failed",
             )
     else:
+        # New uploads are hashed while streaming and only need a remote size
+        # check: the SFTP/SSH channel already guarantees integrity in transit.
+        # Resumed uploads keep the full two-sided check because their existing
+        # prefix was written by an earlier session and could be stale.
+        digest = hashlib.sha256() if offset == 0 else None
         started = time.monotonic()
         with source_path.open("rb") as source:
             source.seek(offset)
@@ -244,6 +287,8 @@ def upload_one(
                 while chunk := source.read(CHUNK_SIZE):
                     _check_cancel(check)
                     remote.write(chunk)
+                    if digest is not None:
+                        digest.update(chunk)
                     sent += len(chunk)
                     if progress:
                         progress(sent, total)
@@ -263,13 +308,16 @@ def upload_one(
                 f"远端临时文件长度不匹配：期望 {total} 字节，实际 {remote_size} 字节",
                 code="verify_failed",
             )
-        source_hash, remote_hash = _timed_verify(
-            sftp, source_path, partial_path, total, check, verify_progress
-        )
-        if source_hash != remote_hash:
-            raise TransferError(
-                "SHA-256 校验失败；已保留远端临时文件", code="verify_failed"
+        if digest is not None:
+            source_hash = digest.hexdigest()
+        else:
+            source_hash, remote_hash = _timed_verify(
+                sftp, source_path, partial_path, total, check, verify_progress
             )
+            if source_hash != remote_hash:
+                raise TransferError(
+                    "SHA-256 校验失败；已保留远端临时文件", code="verify_failed"
+                )
 
     _check_cancel(check)
     if _source_signature(source_path) != initial_signature:
@@ -300,7 +348,10 @@ def upload_file(
     overwrite: bool = False,
     client_factory: Callable[[], paramiko.SSHClient] = paramiko.SSHClient,
 ) -> TransferResult:
-    """Upload one file, resuming ``.landrop.part`` and verifying SHA-256.
+    """Upload one file, resuming ``.irecon.part`` and verifying resumed files.
+
+    New uploads are hashed while streaming and length-checked remotely; files
+    resumed from an earlier session are verified with SHA-256 on both sides.
 
     Unknown host keys are rejected. Use ``known_hosts_path`` to specify the
     trust database; provisioning a new host key requires a separate explicit
@@ -347,7 +398,7 @@ def upload_file(
         raise
     except (TransferError, ValueError):
         raise
-    except (OSError, paramiko.SSHException) as exc:
+    except (OSError, paramiko.SSHException, EOFError) as exc:
         raise classify_connection_error(exc) from exc
     finally:
         sftp.close()

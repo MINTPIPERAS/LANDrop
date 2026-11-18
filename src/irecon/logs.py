@@ -8,8 +8,8 @@ import time
 from datetime import date
 from pathlib import Path
 
-LOG_NAME = "landrop.log"
-LOGGER_NAME = "landrop"
+LOG_NAME = "irecon.log"
+LOGGER_NAME = "irecon"
 MAX_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_RETENTION_DAYS = 14
 ROTATED_PREFIX = LOG_NAME + "."
@@ -17,8 +17,8 @@ ROTATED_PREFIX = LOG_NAME + "."
 
 def _app_root() -> Path:
     if os.name == "nt":
-        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "LANDrop"
-    return Path.home() / ".config" / "landrop"
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "iRecon"
+    return Path.home() / ".config" / "irecon"
 
 
 def default_log_dir() -> Path:
@@ -45,7 +45,7 @@ def validate_log_dir(configured: str = "") -> Path:
         raise ValueError("日志目录必须是绝对路径")
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        probe = directory / f".landrop-probe-{os.getpid()}"
+        probe = directory / f".irecon-probe-{os.getpid()}"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
     except OSError as exc:
@@ -54,7 +54,7 @@ def validate_log_dir(configured: str = "") -> Path:
 
 
 class DailyRotatingFileHandler(logging.Handler):
-    """Append to ``landrop.log``, rotating on date change or at ``max_bytes``.
+    """Append to ``irecon.log``, rotating on date change or at ``max_bytes``.
 
     The standard library's ``TimedRotatingFileHandler`` cannot also cap file
     size, so this keeps both rules in one small handler. Failures while writing
@@ -134,7 +134,7 @@ def configure_logging(
     """Install (or replace) the file handler. Returns the directory, or None.
 
     The handler sits on the root logger so uvicorn's own startup errors land in
-    the file too; the ``landrop`` logger is lowered to INFO so successful
+    the file too; the ``irecon`` logger is lowered to INFO so successful
     transfers are recorded. The root logger's level is left alone — propagated
     records are not gated by ancestor levels.
     """
